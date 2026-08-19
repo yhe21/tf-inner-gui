@@ -1,0 +1,20 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime models, captures, and detection outputs
+*.pt
+*_ncnn_model/
+captures/
+runs/
+data/
+models/
+

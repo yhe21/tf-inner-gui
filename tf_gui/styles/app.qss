@@ -1,0 +1,95 @@
+QMainWindow,
+QWidget#centralWidget {
+    background-color: #eef3f8;
+    color: #172033;
+    font-size: 18px;
+}
+
+QFrame#headerFrame,
+QFrame#footerFrame {
+    background-color: #ffffff;
+    border: 1px solid #d8e0e8;
+    border-radius: 12px;
+}
+
+QLabel#lblTitle {
+    color: #12345b;
+    font-size: 28px;
+    font-weight: 700;
+}
+
+QLabel#lblVt6Status,
+QLabel#lblCameraStatus {
+    min-width: 140px;
+    padding: 8px 12px;
+    color: #9a3412;
+    background-color: #fff1e8;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+QLabel#lblVt6Status[statusOk="true"],
+QLabel#lblCameraStatus[statusOk="true"] {
+    color: #166534;
+    background-color: #dcfce7;
+}
+
+QLabel#lblClock {
+    color: #475569;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+QPushButton[menuButton="true"] {
+    color: #ffffff;
+    background-color: #2367a8;
+    border: 3px solid #ffffff;
+    border-radius: 18px;
+    font-size: 30px;
+    font-weight: 700;
+    padding: 18px;
+}
+
+QPushButton[menuButton="true"]:pressed {
+    background-color: #174a7b;
+    border-color: #9dc8ef;
+}
+
+QPushButton#btnCameraMonitor {
+    background-color: #087f8c;
+}
+
+QPushButton#btnCameraMonitor:pressed {
+    background-color: #075d66;
+}
+
+QLabel#lblFooter {
+    color: #475569;
+    font-size: 17px;
+    font-weight: 600;
+}
+
+QPushButton#btnExit {
+    color: #ffffff;
+    background-color: #b42318;
+    border: none;
+    border-radius: 10px;
+    font-size: 19px;
+    font-weight: 700;
+}
+
+QPushButton#btnExit:pressed {
+    background-color: #7a271a;
+}
+
+QMessageBox {
+    background-color: #ffffff;
+    font-size: 18px;
+}
+
+QMessageBox QPushButton {
+    min-width: 110px;
+    min-height: 48px;
+    font-size: 18px;
+}
