@@ -185,3 +185,75 @@ QPushButton#btnCancel:pressed {
 QPushButton#btnApply:pressed {
     background-color: #11632f;
 }
+
+QDialog#CameraMonitorDialog {
+    background-color: #eef3f8;
+    color: #172033;
+}
+
+QLabel#lblCameraPageTitle {
+    color: #12345b;
+    font-size: 30px;
+    font-weight: 700;
+}
+
+QLabel#lblCaptureMode {
+    padding: 8px 14px;
+    color: #075d66;
+    background-color: #d9f3f5;
+    border-radius: 8px;
+    font-size: 17px;
+    font-weight: 700;
+}
+
+QFrame#cameraImageFrame {
+    background-color: #172033;
+    border: 2px solid #334155;
+    border-radius: 14px;
+}
+
+QLabel#lblCapturedImage {
+    color: #cbd5e1;
+    background-color: #0f172a;
+    border-radius: 8px;
+    font-size: 20px;
+    font-weight: 600;
+}
+
+QLabel#lblCameraPageStatus {
+    color: #475569;
+    font-size: 17px;
+    font-weight: 600;
+}
+
+QPushButton#btnCameraBack,
+QPushButton#btnManualCapture {
+    border: none;
+    border-radius: 10px;
+    font-size: 20px;
+    font-weight: 700;
+}
+
+QPushButton#btnCameraBack {
+    color: #334155;
+    background-color: #dbe3ea;
+}
+
+QPushButton#btnManualCapture {
+    color: #ffffff;
+    background-color: #087f8c;
+}
+
+QPushButton#btnCameraBack:pressed {
+    background-color: #c3ced8;
+}
+
+QPushButton#btnManualCapture:pressed {
+    background-color: #075d66;
+}
+
+QPushButton#btnCameraBack:disabled,
+QPushButton#btnManualCapture:disabled {
+    color: #94a3b8;
+    background-color: #dbe3ea;
+}

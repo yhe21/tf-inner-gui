@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -14,9 +15,11 @@ from PyQt5 import QtWidgets  # noqa: E402
 from main import (  # noqa: E402
     AdjustmentDialog,
     AdjustmentStore,
+    CameraMonitorDialog,
     MAX_VALUE,
     MIN_VALUE,
     STEP,
+    build_capture_path,
 )
 
 
@@ -54,6 +57,19 @@ class AdjustmentTests(unittest.TestCase):
             self.assertEqual(loaded["PickNP"]["X"], 0.15)
             self.assertEqual(loaded["PickNPS"]["Y"], -0.25)
             self.assertEqual(loaded["DropNP"]["U"], 0.50)
+
+    def test_capture_path_uses_date_folder_and_timestamp_filename(self) -> None:
+        captured_at = datetime(2026, 8, 19, 14, 5, 6, 123000)
+        path = build_capture_path(captured_at, Path("captures"))
+        self.assertEqual(
+            path.as_posix(),
+            "captures/20260819/20260819_140506_123.jpg",
+        )
+
+    def test_camera_page_loads_without_picamera_on_pc(self) -> None:
+        dialog = CameraMonitorDialog()
+        self.assertEqual(dialog.btnManualCapture.text(), "手动拍摄并保存")
+        self.assertFalse(dialog.capture_is_running())
 
 
 if __name__ == "__main__":

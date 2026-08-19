@@ -1,19 +1,23 @@
 import argparse
 import json
 import sys
+import time
+from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
-from PyQt5 import QtCore, QtWidgets, uic
+from PyQt5 import QtCore, QtGui, QtWidgets, uic
 
 
 APP_DIR = Path(__file__).resolve().parent
 UI_FILE = APP_DIR / "ui" / "main_menu.ui"
 ADJUSTMENT_UI_FILE = APP_DIR / "ui" / "adjustment_dialog.ui"
+CAMERA_MONITOR_UI_FILE = APP_DIR / "ui" / "camera_monitor_dialog.ui"
 STYLE_FILE = APP_DIR / "styles" / "app.qss"
 CONFIG_FILE = Path.home() / ".config" / "tf_inner" / "adjustments.json"
+CAPTURE_ROOT = APP_DIR / "captures"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -23,6 +27,151 @@ MAX_VALUE = 0.50
 DEFAULT_ADJUSTMENTS = {
     station: {axis: 0.0 for axis in AXES} for station in STATIONS
 }
+
+
+def build_capture_path(
+    captured_at: Optional[datetime] = None, root: Path = CAPTURE_ROOT
+) -> Path:
+    """Build captures/YYYYMMDD/YYYYMMDD_HHMMSS_mmm.jpg."""
+    captured_at = captured_at or datetime.now()
+    date_folder = captured_at.strftime("%Y%m%d")
+    timestamp = captured_at.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return root / date_folder / f"{timestamp}.jpg"
+
+
+class CaptureWorker(QtCore.QObject):
+    """Capture one full-resolution still without blocking the GUI thread."""
+
+    succeeded = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, output_path: Path) -> None:
+        super().__init__()
+        self.output_path = output_path
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        camera = None
+        try:
+            from picamera2 import Picamera2
+
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            camera = Picamera2()
+            full_resolution = camera.sensor_resolution
+            configuration = camera.create_still_configuration(
+                main={"size": full_resolution, "format": "RGB888"}
+            )
+            camera.configure(configuration)
+            camera.start()
+            time.sleep(1.0)
+            camera.capture_file(str(self.output_path))
+            self.succeeded.emit(str(self.output_path))
+        except Exception as error:  # Picamera2 raises several backend exceptions.
+            self.failed.emit(str(error))
+        finally:
+            if camera is not None:
+                with suppress(Exception):
+                    camera.stop()
+                with suppress(Exception):
+                    camera.close()
+
+
+class CameraMonitorDialog(QtWidgets.QDialog):
+    """Temporary camera page for manually collecting training images."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        uic.loadUi(str(CAMERA_MONITOR_UI_FILE), self)
+        self.capture_thread: Optional[QtCore.QThread] = None
+        self.capture_worker: Optional[CaptureWorker] = None
+        self.last_capture_path: Optional[Path] = None
+
+        self.btnManualCapture.clicked.connect(self.start_capture)
+        self.btnCameraBack.clicked.connect(self.reject)
+
+    def capture_is_running(self) -> bool:
+        return self.capture_thread is not None and self.capture_thread.isRunning()
+
+    def start_capture(self) -> None:
+        if self.capture_is_running():
+            return
+
+        output_path = build_capture_path()
+        self.lblCameraPageStatus.setText("正在拍摄，请保持产品静止……")
+        self.btnManualCapture.setEnabled(False)
+        self.btnCameraBack.setEnabled(False)
+
+        self.capture_thread = QtCore.QThread(self)
+        self.capture_worker = CaptureWorker(output_path)
+        self.capture_worker.moveToThread(self.capture_thread)
+        self.capture_thread.started.connect(self.capture_worker.run)
+        self.capture_worker.succeeded.connect(self.capture_succeeded)
+        self.capture_worker.failed.connect(self.capture_failed)
+        self.capture_worker.succeeded.connect(self.capture_thread.quit)
+        self.capture_worker.failed.connect(self.capture_thread.quit)
+        self.capture_thread.finished.connect(self.capture_finished)
+        self.capture_thread.finished.connect(self.capture_worker.deleteLater)
+        self.capture_thread.finished.connect(self.capture_thread.deleteLater)
+        self.capture_thread.start()
+
+    @QtCore.pyqtSlot(str)
+    def capture_succeeded(self, path_text: str) -> None:
+        self.last_capture_path = Path(path_text)
+        self.show_captured_image(self.last_capture_path)
+        relative_path = self.last_capture_path.relative_to(APP_DIR)
+        self.lblCameraPageStatus.setText(f"拍摄成功，已保存：{relative_path}")
+
+    @QtCore.pyqtSlot(str)
+    def capture_failed(self, error_message: str) -> None:
+        self.lblCameraPageStatus.setText("拍摄失败，请检查摄像头连接")
+        QtWidgets.QMessageBox.critical(
+            self,
+            "拍摄失败",
+            f"无法从摄像头获取图片：\n{error_message}",
+        )
+
+    @QtCore.pyqtSlot()
+    def capture_finished(self) -> None:
+        self.btnManualCapture.setEnabled(True)
+        self.btnCameraBack.setEnabled(True)
+        self.capture_worker = None
+        self.capture_thread = None
+
+    def show_captured_image(self, image_path: Path) -> None:
+        reader = QtGui.QImageReader(str(image_path))
+        target_size = self.lblCapturedImage.size()
+        image_size = reader.size()
+        if image_size.isValid():
+            image_size.scale(target_size, QtCore.Qt.KeepAspectRatio)
+            reader.setScaledSize(image_size)
+        image = reader.read()
+        if image.isNull():
+            self.lblCapturedImage.setText("图片已保存，但预览加载失败")
+            return
+
+        self.lblCapturedImage.setPixmap(QtGui.QPixmap.fromImage(image))
+        self.lblCapturedImage.setText("")
+
+    def reject(self) -> None:
+        if self.capture_is_running():
+            QtWidgets.QMessageBox.information(
+                self,
+                "正在拍摄",
+                "请等待当前照片保存完成后再返回。",
+            )
+            return
+        super().reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.capture_is_running():
+            event.ignore()
+            QtWidgets.QMessageBox.information(
+                self,
+                "正在拍摄",
+                "请等待当前照片保存完成后再关闭窗口。",
+            )
+            return
+        super().closeEvent(event)
 
 
 def normalize_value(value: object) -> float:
@@ -158,9 +307,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"无法读取或创建调整数据文件：\n{error}",
             )
 
-        self.btnCameraMonitor.clicked.connect(
-            lambda: self.select_page("摄像头结果监测")
-        )
+        self.btnCameraMonitor.clicked.connect(self.open_camera_monitor)
         self.btnPickNP.clicked.connect(lambda: self.open_adjustment("PickNP"))
         self.btnPickNPS.clicked.connect(lambda: self.open_adjustment("PickNPS"))
         self.btnDropNP.clicked.connect(lambda: self.open_adjustment("DropNP"))
@@ -177,6 +324,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def select_page(self, page_name: str) -> None:
         # The actual pages will replace this message in the next development step.
         self.lblFooter.setText(f"已选择：{page_name}（页面功能待接入）")
+
+    def open_camera_monitor(self) -> None:
+        dialog = CameraMonitorDialog(self)
+        if self.isFullScreen():
+            dialog.setWindowState(dialog.windowState() | QtCore.Qt.WindowFullScreen)
+        dialog.exec_()
+        if dialog.last_capture_path is not None:
+            relative_path = dialog.last_capture_path.relative_to(APP_DIR)
+            self.lblFooter.setText(f"最近拍摄：{relative_path}")
 
     def open_adjustment(self, station: str) -> None:
         dialog = AdjustmentDialog(station, self.adjustments[station], self)
