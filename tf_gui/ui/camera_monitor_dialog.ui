@@ -50,7 +50,7 @@
      </item>
      <item>
       <widget class="QLabel" name="lblCaptureMode">
-       <property name="text"><string>生产待机模式 · 1920×1080</string></property>
+       <property name="text"><string>生产待机模式 · 原生分辨率</string></property>
       </widget>
      </item>
     </layout>

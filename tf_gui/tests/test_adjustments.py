@@ -21,7 +21,6 @@ from main import (  # noqa: E402
     CAMERA_BUFFER_COUNT,
     MAX_VALUE,
     MIN_VALUE,
-    PRODUCTION_CAPTURE_SIZE,
     STEP,
     build_capture_path,
 )
@@ -94,6 +93,7 @@ class AdjustmentTests(unittest.TestCase):
 
         class FakeCamera:
             def __init__(self) -> None:
+                self.sensor_resolution = (4056, 3040)
                 self.configuration_options = None
                 self.request = FakeRequest()
                 self.flush_value = None
@@ -141,7 +141,7 @@ class AdjustmentTests(unittest.TestCase):
             self.assertEqual(acquired, [(str(output_path), 123456789)])
 
         options = fake_camera.configuration_options
-        self.assertEqual(options["main"]["size"], PRODUCTION_CAPTURE_SIZE)
+        self.assertEqual(options["main"]["size"], fake_camera.sensor_resolution)
         self.assertEqual(options["buffer_count"], CAMERA_BUFFER_COUNT)
         self.assertFalse(options["queue"])
         self.assertTrue(fake_camera.flush_value)

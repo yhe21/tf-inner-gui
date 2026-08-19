@@ -19,7 +19,6 @@ CAMERA_MONITOR_UI_FILE = APP_DIR / "ui" / "camera_monitor_dialog.ui"
 STYLE_FILE = APP_DIR / "styles" / "app.qss"
 CONFIG_FILE = Path.home() / ".config" / "tf_inner" / "adjustments.json"
 CAPTURE_ROOT = APP_DIR / "captures"
-PRODUCTION_CAPTURE_SIZE = (1920, 1080)
 CAMERA_BUFFER_COUNT = 4
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
@@ -83,8 +82,9 @@ class CaptureWorker(QtCore.QObject):
         camera = None
         try:
             camera = self.camera_factory()
+            native_resolution = tuple(camera.sensor_resolution)
             configuration = camera.create_still_configuration(
-                main={"size": PRODUCTION_CAPTURE_SIZE, "format": "RGB888"},
+                main={"size": native_resolution, "format": "RGB888"},
                 buffer_count=CAMERA_BUFFER_COUNT,
                 queue=False,
             )
@@ -93,7 +93,7 @@ class CaptureWorker(QtCore.QObject):
 
             # Auto-exposure and white balance settle once, not on every trigger.
             time.sleep(self.warmup_seconds)
-            self.ready.emit(*PRODUCTION_CAPTURE_SIZE)
+            self.ready.emit(*native_resolution)
 
             while True:
                 output_path = self.commands.get()
