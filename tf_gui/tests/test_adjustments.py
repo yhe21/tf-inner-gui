@@ -15,9 +15,13 @@ from PyQt5 import QtWidgets  # noqa: E402
 from main import (  # noqa: E402
     AdjustmentDialog,
     AdjustmentStore,
+    CameraController,
     CameraMonitorDialog,
+    CaptureWorker,
+    CAMERA_BUFFER_COUNT,
     MAX_VALUE,
     MIN_VALUE,
+    PRODUCTION_CAPTURE_SIZE,
     STEP,
     build_capture_path,
 )
@@ -67,9 +71,84 @@ class AdjustmentTests(unittest.TestCase):
         )
 
     def test_camera_page_loads_without_picamera_on_pc(self) -> None:
-        dialog = CameraMonitorDialog()
+        controller = CameraController()
+        dialog = CameraMonitorDialog(controller)
         self.assertEqual(dialog.btnManualCapture.text(), "手动拍摄并保存")
         self.assertFalse(dialog.capture_is_running())
+
+    def test_persistent_worker_captures_a_fresh_frame_and_releases_it(self) -> None:
+        class FakeRequest:
+            def __init__(self) -> None:
+                self.released = False
+                self.saved_stream = None
+
+            def get_metadata(self):
+                return {"SensorTimestamp": 123456789}
+
+            def save(self, stream_name, path_text):
+                self.saved_stream = stream_name
+                Path(path_text).write_bytes(b"fake-jpeg")
+
+            def release(self):
+                self.released = True
+
+        class FakeCamera:
+            def __init__(self) -> None:
+                self.configuration_options = None
+                self.request = FakeRequest()
+                self.flush_value = None
+                self.started = False
+                self.stopped = False
+                self.closed = False
+
+            def create_still_configuration(self, **options):
+                self.configuration_options = options
+                return options
+
+            def configure(self, _configuration):
+                pass
+
+            def start(self):
+                self.started = True
+
+            def capture_request(self, flush):
+                self.flush_value = flush
+                return self.request
+
+            def stop(self):
+                self.stopped = True
+
+            def close(self):
+                self.closed = True
+
+        fake_camera = FakeCamera()
+        worker = CaptureWorker(lambda: fake_camera, warmup_seconds=0.0)
+        acquired = []
+        succeeded = []
+        worker.frame_acquired.connect(
+            lambda path, timestamp: acquired.append((path, timestamp))
+        )
+        worker.succeeded.connect(succeeded.append)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "capture.jpg"
+            worker.request_capture(output_path)
+            worker.stop()
+            worker.run()
+
+            self.assertTrue(output_path.exists())
+            self.assertEqual(succeeded, [str(output_path)])
+            self.assertEqual(acquired, [(str(output_path), 123456789)])
+
+        options = fake_camera.configuration_options
+        self.assertEqual(options["main"]["size"], PRODUCTION_CAPTURE_SIZE)
+        self.assertEqual(options["buffer_count"], CAMERA_BUFFER_COUNT)
+        self.assertFalse(options["queue"])
+        self.assertTrue(fake_camera.flush_value)
+        self.assertEqual(fake_camera.request.saved_stream, "main")
+        self.assertTrue(fake_camera.request.released)
+        self.assertTrue(fake_camera.stopped)
+        self.assertTrue(fake_camera.closed)
 
 
 if __name__ == "__main__":
