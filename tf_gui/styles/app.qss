@@ -93,3 +93,95 @@ QMessageBox QPushButton {
     min-height: 48px;
     font-size: 18px;
 }
+
+QDialog#AdjustmentDialog {
+    background-color: #eef3f8;
+    color: #172033;
+}
+
+QLabel#lblDialogTitle {
+    color: #12345b;
+    font-size: 30px;
+    font-weight: 700;
+}
+
+QLabel#lblStep,
+QLabel#lblRangeInfo {
+    color: #475569;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+QFrame#adjustmentFrame {
+    background-color: #ffffff;
+    border: 1px solid #d8e0e8;
+    border-radius: 14px;
+    padding: 12px;
+}
+
+QLabel#lblAxisX,
+QLabel#lblAxisY,
+QLabel#lblAxisZ,
+QLabel#lblAxisU {
+    min-width: 70px;
+    color: #12345b;
+    font-size: 30px;
+    font-weight: 800;
+}
+
+QLabel[valueDisplay="true"] {
+    min-width: 210px;
+    min-height: 64px;
+    color: #172033;
+    background-color: #f8fafc;
+    border: 2px solid #cbd5e1;
+    border-radius: 10px;
+    font-size: 28px;
+    font-weight: 700;
+}
+
+QPushButton[adjustButton="true"] {
+    min-width: 120px;
+    min-height: 64px;
+    color: #ffffff;
+    background-color: #2367a8;
+    border: none;
+    border-radius: 12px;
+    font-size: 38px;
+    font-weight: 800;
+}
+
+QPushButton[adjustButton="true"]:pressed {
+    background-color: #174a7b;
+}
+
+QPushButton[adjustButton="true"]:disabled {
+    color: #94a3b8;
+    background-color: #dbe3ea;
+}
+
+QPushButton#btnCancel,
+QPushButton#btnApply {
+    border: none;
+    border-radius: 10px;
+    font-size: 20px;
+    font-weight: 700;
+}
+
+QPushButton#btnCancel {
+    color: #334155;
+    background-color: #dbe3ea;
+}
+
+QPushButton#btnApply {
+    color: #ffffff;
+    background-color: #16803c;
+}
+
+QPushButton#btnCancel:pressed {
+    background-color: #c3ced8;
+}
+
+QPushButton#btnApply:pressed {
+    background-color: #11632f;
+}

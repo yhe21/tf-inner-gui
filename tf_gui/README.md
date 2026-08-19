@@ -6,6 +6,16 @@
 - `styles/app.qss`：颜色、字体和触摸按钮样式
 - `main.py`：按钮事件、时钟和运行模式
 
+三个调整页面共用同一套触摸界面。PickNP、PickNPS 和 DropNP 分别保存
+X/Y/Z/U 调整数值，固定步长为 0.05，允许范围为 -0.50～+0.50。
+点击“应用并保存”后，数据会写入：
+
+```text
+~/.config/tf_inner/adjustments.json
+```
+
+程序每次启动都会自动读取该文件；点击“取消”不会改变已保存的数据。
+
 ## 在 Windows PC 上编辑和测试
 
 在 PowerShell 中进入本目录，然后执行：

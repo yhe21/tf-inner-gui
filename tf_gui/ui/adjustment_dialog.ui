@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>AdjustmentDialog</class>
+ <widget class="QDialog" name="AdjustmentDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>900</width>
+    <height>560</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>800</width>
+    <height>480</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>调整</string>
+  </property>
+  <layout class="QVBoxLayout" name="mainLayout">
+   <property name="spacing">
+    <number>16</number>
+   </property>
+   <property name="leftMargin">
+    <number>24</number>
+   </property>
+   <property name="topMargin">
+    <number>20</number>
+   </property>
+   <property name="rightMargin">
+    <number>24</number>
+   </property>
+   <property name="bottomMargin">
+    <number>20</number>
+   </property>
+   <item>
+    <layout class="QHBoxLayout" name="titleLayout">
+     <item>
+      <widget class="QLabel" name="lblDialogTitle">
+       <property name="text">
+        <string>调整</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="titleSpacer">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QLabel" name="lblStep">
+       <property name="text">
+        <string>固定步长：0.05 mm / 0.05°</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QFrame" name="adjustmentFrame">
+     <property name="frameShape">
+      <enum>QFrame::NoFrame</enum>
+     </property>
+     <layout class="QGridLayout" name="axisGrid">
+      <property name="horizontalSpacing">
+       <number>20</number>
+      </property>
+      <property name="verticalSpacing">
+       <number>14</number>
+      </property>
+      <item row="0" column="0"><widget class="QLabel" name="lblAxisX"><property name="text"><string>X</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="0" column="1"><widget class="QPushButton" name="btnXMinus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>−</string></property></widget></item>
+      <item row="0" column="2"><widget class="QLabel" name="lblXValue"><property name="valueDisplay" stdset="0"><bool>true</bool></property><property name="text"><string>+0.00 mm</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="0" column="3"><widget class="QPushButton" name="btnXPlus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>+</string></property></widget></item>
+      <item row="1" column="0"><widget class="QLabel" name="lblAxisY"><property name="text"><string>Y</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="1" column="1"><widget class="QPushButton" name="btnYMinus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>−</string></property></widget></item>
+      <item row="1" column="2"><widget class="QLabel" name="lblYValue"><property name="valueDisplay" stdset="0"><bool>true</bool></property><property name="text"><string>+0.00 mm</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="1" column="3"><widget class="QPushButton" name="btnYPlus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>+</string></property></widget></item>
+      <item row="2" column="0"><widget class="QLabel" name="lblAxisZ"><property name="text"><string>Z</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="2" column="1"><widget class="QPushButton" name="btnZMinus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>−</string></property></widget></item>
+      <item row="2" column="2"><widget class="QLabel" name="lblZValue"><property name="valueDisplay" stdset="0"><bool>true</bool></property><property name="text"><string>+0.00 mm</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="2" column="3"><widget class="QPushButton" name="btnZPlus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>+</string></property></widget></item>
+      <item row="3" column="0"><widget class="QLabel" name="lblAxisU"><property name="text"><string>U</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="3" column="1"><widget class="QPushButton" name="btnUMinus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>−</string></property></widget></item>
+      <item row="3" column="2"><widget class="QLabel" name="lblUValue"><property name="valueDisplay" stdset="0"><bool>true</bool></property><property name="text"><string>+0.00°</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
+      <item row="3" column="3"><widget class="QPushButton" name="btnUPlus"><property name="adjustButton" stdset="0"><bool>true</bool></property><property name="text"><string>+</string></property></widget></item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="lblRangeInfo">
+     <property name="text"><string>允许范围：−0.50 ～ +0.50　　点击“应用”后保存</string></property>
+     <property name="alignment"><set>Qt::AlignCenter</set></property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="actionLayout">
+     <item><spacer name="actionSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+     <item><widget class="QPushButton" name="btnCancel"><property name="minimumSize"><size><width>160</width><height>58</height></size></property><property name="text"><string>取消</string></property></widget></item>
+     <item><widget class="QPushButton" name="btnApply"><property name="minimumSize"><size><width>180</width><height>58</height></size></property><property name="text"><string>应用并保存</string></property></widget></item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
