@@ -1,7 +1,6 @@
 import os
 import sys
 import tempfile
-import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-from PyQt5 import QtNetwork, QtWidgets  # noqa: E402
+from PyQt5 import QtWidgets  # noqa: E402
 
 from main import (  # noqa: E402
     AdjustmentDialog,
@@ -23,7 +22,6 @@ from main import (  # noqa: E402
     MAX_VALUE,
     MIN_VALUE,
     STEP,
-    Vt6TcpServer,
     build_capture_path,
 )
 
@@ -151,68 +149,6 @@ class AdjustmentTests(unittest.TestCase):
         self.assertTrue(fake_camera.request.released)
         self.assertTrue(fake_camera.stopped)
         self.assertTrue(fake_camera.closed)
-
-    def test_vt6_tcp_server_accepts_capture_and_reports_acquired(self) -> None:
-        controller = CameraController()
-        controller.ready = True
-        captured_paths = []
-
-        def capture(output_path):
-            controller.busy = True
-            captured_paths.append(output_path)
-            return True
-
-        controller.capture = capture
-        server = Vt6TcpServer(controller, "127.0.0.1", 0)
-        self.assertTrue(server.start())
-
-        client = QtNetwork.QTcpSocket()
-        client.connectToHost("127.0.0.1", server.port)
-        self.assertTrue(client.waitForConnected(1000))
-        self.assertTrue(self.wait_until(lambda: len(server.clients) == 1))
-
-        self.assertEqual(self.send_command(client, "PING"), "PONG")
-        self.assertEqual(self.send_command(client, "STATUS"), "STATUS READY")
-
-        acknowledgement = self.send_command(client, "CAPTURE")
-        self.assertTrue(acknowledgement.startswith("ACK CAPTURE "))
-        self.assertEqual(len(captured_paths), 1)
-
-        capture_path = captured_paths[0]
-        controller.frame_acquired.emit(str(capture_path), 123456789)
-        self.assertEqual(
-            self.read_response(client),
-            f"ACQUIRED {capture_path.stem} 123456789",
-        )
-
-        controller.on_capture_succeeded(str(capture_path))
-        saved_response = self.read_response(client)
-        self.assertTrue(saved_response.startswith(f"SAVED {capture_path.stem} "))
-
-        client.disconnectFromHost()
-        server.stop()
-
-    @classmethod
-    def wait_until(cls, condition, timeout_seconds=1.0):
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            cls.app.processEvents()
-            if condition():
-                return True
-            time.sleep(0.005)
-        return condition()
-
-    @classmethod
-    def read_response(cls, client):
-        if not cls.wait_until(client.canReadLine):
-            raise AssertionError("Timed out waiting for TCP response")
-        return bytes(client.readLine()).decode("utf-8").strip()
-
-    @classmethod
-    def send_command(cls, client, command):
-        client.write((command + "\r\n").encode("ascii"))
-        client.flush()
-        return cls.read_response(client)
 
 
 if __name__ == "__main__":

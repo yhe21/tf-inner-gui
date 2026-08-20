@@ -31,30 +31,6 @@ captures/YYYYMMDD/YYYYMMDD_HHMMSS_mmm.jpg
 
 例如：`captures/20260819/20260819_153045_123.jpg`。
 
-## VT6 TCP 服务
-
-程序默认监听所有 IPv4 网卡的 `5000` 端口。VT6 每条命令必须以 CRLF 结尾，
-例如发送 `CAPTURE\r\n`。命令和响应如下：
-
-```text
-PING       -> PONG
-STATUS     -> STATUS READY / STATUS BUSY / STATUS CAMERA_NOT_READY
-CAPTURE    -> ACK CAPTURE <时间戳>
-              ACQUIRED <时间戳> <传感器时间>
-              SAVED <时间戳> <图片相对路径>
-TRIGGER    -> 与 CAPTURE 相同
-```
-
-`ACK` 表示已接受请求；`ACQUIRED` 表示图像已经完成采集，之后 JPG 保存和界面显示
-可以继续执行。摄像头未就绪或正在处理上一张时会返回英文 `ERR` 信息。
-
-修改端口或只测试 GUI：
-
-```bash
-python3 main.py --tcp-port 5001
-python3 main.py --no-tcp
-```
-
 ## 在 Windows PC 上编辑和测试
 
 在 PowerShell 中进入本目录，然后执行：
