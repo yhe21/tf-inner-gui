@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-from PyQt5 import QtCore, QtGui, QtWidgets, uic
+from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets, uic
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -20,6 +20,9 @@ STYLE_FILE = APP_DIR / "styles" / "app.qss"
 CONFIG_FILE = Path.home() / ".config" / "tf_inner" / "adjustments.json"
 CAPTURE_ROOT = APP_DIR / "captures"
 CAMERA_BUFFER_COUNT = 4
+DEFAULT_TCP_HOST = "0.0.0.0"
+DEFAULT_TCP_PORT = 5000
+MAX_TCP_LINE_BYTES = 1024
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -39,6 +42,16 @@ def build_capture_path(
     date_folder = captured_at.strftime("%Y%m%d")
     timestamp = captured_at.strftime("%Y%m%d_%H%M%S_%f")[:-3]
     return root / date_folder / f"{timestamp}.jpg"
+
+
+def tcp_port_value(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("TCP port must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("TCP port must be between 1 and 65535")
+    return port
 
 
 def create_picamera2() -> object:
@@ -223,6 +236,187 @@ class CameraController(QtCore.QObject):
     def on_thread_finished(self) -> None:
         self.ready = False
         self.busy = False
+
+
+class Vt6TcpServer(QtCore.QObject):
+    """Line-based TCP server that turns VT6 commands into camera triggers."""
+
+    status_changed = QtCore.pyqtSignal(str, bool)
+
+    def __init__(
+        self,
+        camera_controller: CameraController,
+        host: str = DEFAULT_TCP_HOST,
+        port: int = DEFAULT_TCP_PORT,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.camera_controller = camera_controller
+        self.host = host
+        self.port = port
+        self.server = QtNetwork.QTcpServer(self)
+        self.clients: Dict[QtNetwork.QTcpSocket, bytearray] = {}
+        self.active_client: Optional[QtNetwork.QTcpSocket] = None
+        self.active_capture_path: Optional[Path] = None
+
+        self.server.newConnection.connect(self.accept_connections)
+        self.camera_controller.frame_acquired.connect(self.on_frame_acquired)
+        self.camera_controller.capture_succeeded.connect(self.on_capture_succeeded)
+        self.camera_controller.capture_failed.connect(self.on_capture_failed)
+
+    def start(self) -> bool:
+        address = QtNetwork.QHostAddress(self.host)
+        if address.isNull():
+            self.status_changed.emit(f"VT6 地址无效：{self.host}", False)
+            return False
+        if not self.server.listen(address, self.port):
+            self.status_changed.emit(
+                f"VT6 端口错误：{self.server.errorString()}", False
+            )
+            return False
+
+        self.port = int(self.server.serverPort())
+        self.status_changed.emit(f"VT6 等待连接 :{self.port}", False)
+        return True
+
+    def stop(self) -> None:
+        self.active_client = None
+        self.active_capture_path = None
+        for client in list(self.clients):
+            client.disconnectFromHost()
+            client.deleteLater()
+        self.clients.clear()
+        self.server.close()
+
+    @QtCore.pyqtSlot()
+    def accept_connections(self) -> None:
+        while self.server.hasPendingConnections():
+            client = self.server.nextPendingConnection()
+            if client is None:
+                continue
+            self.clients[client] = bytearray()
+            client.readyRead.connect(
+                lambda connected_client=client: self.read_client(connected_client)
+            )
+            client.disconnected.connect(
+                lambda connected_client=client: self.remove_client(connected_client)
+            )
+        self.update_connection_status()
+
+    def remove_client(self, client: QtNetwork.QTcpSocket) -> None:
+        self.clients.pop(client, None)
+        if self.active_client is client:
+            self.active_client = None
+        client.deleteLater()
+        self.update_connection_status()
+
+    def update_connection_status(self) -> None:
+        count = len(self.clients)
+        if count:
+            self.status_changed.emit(f"VT6 已连接 ({count})", True)
+        elif self.server.isListening():
+            self.status_changed.emit(f"VT6 等待连接 :{self.port}", False)
+
+    def read_client(self, client: QtNetwork.QTcpSocket) -> None:
+        if client not in self.clients:
+            return
+        buffer = self.clients[client]
+        buffer.extend(bytes(client.readAll()))
+
+        if len(buffer) > MAX_TCP_LINE_BYTES and b"\n" not in buffer:
+            buffer.clear()
+            self.send_line(client, "ERR LINE_TOO_LONG")
+            return
+
+        while b"\n" in buffer:
+            raw_line, remainder = buffer.split(b"\n", 1)
+            buffer[:] = remainder
+            command = raw_line.rstrip(b"\r").decode("ascii", errors="ignore").strip()
+            if command:
+                self.handle_command(client, command)
+
+    def handle_command(self, client: QtNetwork.QTcpSocket, command: str) -> None:
+        normalized_command = command.upper()
+        if normalized_command == "PING":
+            self.send_line(client, "PONG")
+            return
+        if normalized_command == "STATUS":
+            if self.camera_controller.busy:
+                status = "BUSY"
+            elif self.camera_controller.ready:
+                status = "READY"
+            else:
+                status = "CAMERA_NOT_READY"
+            self.send_line(client, f"STATUS {status}")
+            return
+        if normalized_command in {"CAPTURE", "TRIGGER"}:
+            self.trigger_capture(client)
+            return
+        if normalized_command == "HELP":
+            self.send_line(client, "COMMANDS PING STATUS CAPTURE TRIGGER")
+            return
+        self.send_line(client, "ERR UNKNOWN_COMMAND")
+
+    def trigger_capture(self, client: QtNetwork.QTcpSocket) -> None:
+        if not self.camera_controller.ready:
+            self.send_line(client, "ERR CAMERA_NOT_READY")
+            return
+        if self.camera_controller.busy:
+            self.send_line(client, "ERR BUSY")
+            return
+
+        output_path = build_capture_path()
+        if not self.camera_controller.capture(output_path):
+            self.send_line(client, "ERR CAPTURE_REJECTED")
+            return
+
+        self.active_client = client
+        self.active_capture_path = output_path
+        self.send_line(client, f"ACK CAPTURE {output_path.stem}")
+
+    @QtCore.pyqtSlot(str, int)
+    def on_frame_acquired(self, path_text: str, sensor_timestamp: int) -> None:
+        if not self.is_active_capture(path_text):
+            return
+        self.send_active(
+            f"ACQUIRED {self.active_capture_path.stem} {sensor_timestamp}"
+        )
+
+    @QtCore.pyqtSlot(str)
+    def on_capture_succeeded(self, path_text: str) -> None:
+        if not self.is_active_capture(path_text):
+            return
+        capture_id = self.active_capture_path.stem
+        relative_path = self.active_capture_path.relative_to(APP_DIR).as_posix()
+        self.send_active(f"SAVED {capture_id} {relative_path}")
+        self.active_client = None
+        self.active_capture_path = None
+
+    @QtCore.pyqtSlot(str)
+    def on_capture_failed(self, error_message: str) -> None:
+        if self.active_capture_path is None:
+            return
+        capture_id = self.active_capture_path.stem
+        safe_error = " ".join(error_message.splitlines())
+        self.send_active(f"ERR CAPTURE {capture_id} {safe_error}")
+        self.active_client = None
+        self.active_capture_path = None
+
+    def is_active_capture(self, path_text: str) -> bool:
+        return (
+            self.active_capture_path is not None
+            and Path(path_text) == self.active_capture_path
+        )
+
+    def send_active(self, message: str) -> None:
+        if self.active_client is not None:
+            self.send_line(self.active_client, message)
+
+    @staticmethod
+    def send_line(client: QtNetwork.QTcpSocket, message: str) -> None:
+        if client.state() == QtNetwork.QAbstractSocket.ConnectedState:
+            client.write((message + "\r\n").encode("utf-8"))
+            client.flush()
 
 
 class CameraMonitorDialog(QtWidgets.QDialog):
@@ -472,7 +666,13 @@ class AdjustmentDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     """Touch-friendly entry page for the TF Inner application."""
 
-    def __init__(self, store: Optional[AdjustmentStore] = None) -> None:
+    def __init__(
+        self,
+        store: Optional[AdjustmentStore] = None,
+        tcp_host: str = DEFAULT_TCP_HOST,
+        tcp_port: int = DEFAULT_TCP_PORT,
+        tcp_enabled: bool = True,
+    ) -> None:
         super().__init__()
         uic.loadUi(str(UI_FILE), self)
 
@@ -500,6 +700,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.camera_controller.status_changed.connect(self.update_camera_status)
         self.camera_controller.start()
 
+        self.vt6_server: Optional[Vt6TcpServer] = None
+        if tcp_enabled:
+            self.vt6_server = Vt6TcpServer(
+                self.camera_controller, tcp_host, tcp_port, self
+            )
+            self.vt6_server.status_changed.connect(self.update_vt6_status)
+            self.vt6_server.start()
+        else:
+            self.update_vt6_status("VT6 服务已关闭", False)
+
         self.clock_timer = QtCore.QTimer(self)
         self.clock_timer.timeout.connect(self.update_clock)
         self.clock_timer.start(1000)
@@ -514,6 +724,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lblCameraStatus.setProperty("statusOk", is_ready)
         self.lblCameraStatus.style().unpolish(self.lblCameraStatus)
         self.lblCameraStatus.style().polish(self.lblCameraStatus)
+
+    @QtCore.pyqtSlot(str, bool)
+    def update_vt6_status(self, status_text: str, is_connected: bool) -> None:
+        self.lblVt6Status.setText(f"● {status_text}")
+        self.lblVt6Status.setProperty("statusOk", is_connected)
+        self.lblVt6Status.style().unpolish(self.lblVt6Status)
+        self.lblVt6Status.style().polish(self.lblVt6Status)
 
     def select_page(self, page_name: str) -> None:
         # The actual pages will replace this message in the next development step.
@@ -568,6 +785,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.close()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.vt6_server is not None:
+            self.vt6_server.stop()
         if not self.camera_controller.stop():
             event.ignore()
             QtWidgets.QMessageBox.warning(
@@ -586,6 +805,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run in full-screen mode on the Raspberry Pi touch screen.",
     )
+    parser.add_argument(
+        "--tcp-host",
+        default=DEFAULT_TCP_HOST,
+        help=f"TCP listen address (default: {DEFAULT_TCP_HOST}).",
+    )
+    parser.add_argument(
+        "--tcp-port",
+        type=tcp_port_value,
+        default=DEFAULT_TCP_PORT,
+        metavar="PORT",
+        help=f"VT6 TCP port (default: {DEFAULT_TCP_PORT}).",
+    )
+    parser.add_argument(
+        "--no-tcp",
+        action="store_true",
+        help="Disable the VT6 TCP server for UI-only testing.",
+    )
     return parser.parse_args()
 
 
@@ -594,7 +830,11 @@ def main() -> int:
     app = QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName("TF Inner Detection")
 
-    window = MainWindow()
+    window = MainWindow(
+        tcp_host=args.tcp_host,
+        tcp_port=args.tcp_port,
+        tcp_enabled=not args.no_tcp,
+    )
     if args.fullscreen:
         window.showFullScreen()
     else:
