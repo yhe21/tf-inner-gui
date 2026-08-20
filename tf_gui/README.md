@@ -31,6 +31,48 @@ captures/YYYYMMDD/YYYYMMDD_HHMMSS_mmm.jpg
 
 例如：`captures/20260819/20260819_153045_123.jpg`。
 
+## VT6训练采图协议
+
+程序默认作为TCP服务器监听所有IPv4网卡的5000端口。连接不设置空闲超时，
+也不发送心跳。VT6发送的ASCII指令必须以CRLF结尾：
+
+```text
+INNER\r\n
+GLUE\r\n
+CALIB\r\n
+```
+
+训练采图阶段，INNER和GLUE都会以原生分辨率保存图片，并固定返回OK：
+
+```text
+INNER,OK\r\n
+GLUE,OK\r\n
+```
+
+图片分别保存在：
+
+```text
+captures/YYYYMMDD/INNER/时间戳.jpg
+captures/YYYYMMDD/GLUE/时间戳.jpg
+```
+
+只有摄像头采集或保存失败时才会返回`INNER,NG`或`GLUE,NG`。正式检测阶段
+将改为运行对应YOLO模型，NG保存图片，OK不保存图片。
+
+`CALIB`不拍照，直接返回12个逗号分隔的数值，固定顺序为：
+
+```text
+NP_X,NP_Y,NP_Z,NP_U,NPS_X,NPS_Y,NPS_Z,NPS_U,DROP_X,DROP_Y,DROP_Z,DROP_U
+```
+
+如果连接中断，已经完成但尚未发送的结果会保留在内存中，并在VT6重新连接
+后继续发送。修改端口或关闭TCP服务：
+
+```bash
+python3 main.py --tcp-port 5001
+python3 main.py --no-tcp
+```
+
 ## 在 Windows PC 上编辑和测试
 
 在 PowerShell 中进入本目录，然后执行：
