@@ -25,6 +25,7 @@ from main import (  # noqa: E402
     STEP,
     Vt6TrainingServer,
     build_capture_path,
+    build_error_capture_path,
 )
 
 
@@ -76,6 +77,16 @@ class AdjustmentTests(unittest.TestCase):
         self.assertEqual(
             categorized_path.as_posix(),
             "captures/20260819/INNER/20260819_140506_123.jpg",
+        )
+
+    def test_error_capture_path_uses_one_flat_folder(self) -> None:
+        captured_at = datetime(2026, 8, 21, 14, 5, 6, 123000)
+        path = build_error_capture_path(
+            "pick np no vac", captured_at, Path("error_records")
+        )
+        self.assertEqual(
+            path.as_posix(),
+            "error_records/20260821_140506_123_PICK_NP_NO_VAC.jpg",
         )
 
     def test_camera_page_loads_without_picamera_on_pc(self) -> None:
@@ -210,16 +221,56 @@ class AdjustmentTests(unittest.TestCase):
         client.disconnectFromHost()
         self.assertTrue(self.wait_until(lambda: server.current_client is None))
 
-        controller.on_capture_succeeded(str(captured_paths[2]))
-        self.assertEqual(list(server.pending_responses), ["INNER,OK"])
-
         reconnected_client = QtNetwork.QTcpSocket()
         reconnected_client.connectToHost("127.0.0.1", server.port)
         self.assertTrue(reconnected_client.waitForConnected(1000))
-        self.assertEqual(self.read_response(reconnected_client), "INNER,OK")
+        self.assertTrue(
+            self.wait_until(lambda: server.current_client is not None)
+        )
+
+        # The old exposure may finish after a new production connection is
+        # established. Its result must not be delivered to the new session.
+        controller.on_capture_succeeded(str(captured_paths[2]))
+        self.assertFalse(reconnected_client.waitForReadyRead(100))
 
         reconnected_client.disconnectFromHost()
         server.stop()
+
+    def test_unknown_command_is_logged_and_queues_fault_photo_without_reply(self) -> None:
+        controller = CameraController()
+        controller.ready = True
+        captured_paths = []
+
+        def capture(output_path):
+            controller.busy = True
+            captured_paths.append(output_path)
+            return True
+
+        controller.capture = capture
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            error_root = Path(temporary_directory) / "error_records"
+            server = Vt6TrainingServer(
+                controller,
+                lambda: {},
+                port=0,
+                error_root=error_root,
+            )
+
+            server.handle_command("PICK_NP_NO_VAC")
+
+            self.assertEqual(len(captured_paths), 1)
+            self.assertEqual(captured_paths[0].parent, error_root)
+            self.assertIn("PICK_NP_NO_VAC", captured_paths[0].name)
+
+            log_path = error_root / "error.log"
+            self.assertTrue(log_path.exists())
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("PICK_NP_NO_VAC", log_text)
+            self.assertIn("RECEIVED", log_text)
+            self.assertIn(captured_paths[0].name, log_text)
+
+            controller.on_capture_succeeded(str(captured_paths[0]))
 
     @classmethod
     def wait_until(cls, condition, timeout_seconds=1.0):

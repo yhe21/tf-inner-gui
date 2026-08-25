@@ -20,6 +20,7 @@ CAMERA_MONITOR_UI_FILE = APP_DIR / "ui" / "camera_monitor_dialog.ui"
 STYLE_FILE = APP_DIR / "styles" / "app.qss"
 CONFIG_FILE = Path.home() / ".config" / "tf_inner" / "adjustments.json"
 CAPTURE_ROOT = APP_DIR / "captures"
+ERROR_RECORD_ROOT = APP_DIR / "error_records"
 CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
@@ -33,6 +34,10 @@ MAX_VALUE = 0.50
 DEFAULT_ADJUSTMENTS = {
     station: {axis: 0.0 for axis in AXES} for station in STATIONS
 }
+
+# response_session identifies the TCP connection that issued a capture request.
+# A result from an old connection must never be delivered to a new connection.
+CaptureJob = Tuple[Optional[str], Path, Optional[str], Optional[int]]
 
 
 def build_capture_path(
@@ -48,6 +53,25 @@ def build_capture_path(
     if category:
         output_directory = output_directory / category.upper()
     return output_directory / f"{timestamp}.jpg"
+
+
+def sanitize_error_code(error_code: str) -> str:
+    safe_code = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in error_code.upper()
+    ).strip("_")
+    return (safe_code or "UNKNOWN_ERROR")[:64]
+
+
+def build_error_capture_path(
+    error_code: str,
+    captured_at: Optional[datetime] = None,
+    root: Path = ERROR_RECORD_ROOT,
+) -> Path:
+    """Build one flat error_records/timestamp_ERROR_CODE.jpg path."""
+    captured_at = captured_at or datetime.now()
+    timestamp = captured_at.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return root / f"{timestamp}_{sanitize_error_code(error_code)}.jpg"
 
 
 def tcp_port_value(value: str) -> int:
@@ -254,18 +278,22 @@ class Vt6TrainingServer(QtCore.QObject):
         camera_controller: CameraController,
         calibration_provider: Callable[[], Dict[str, Dict[str, float]]],
         port: int = DEFAULT_TCP_PORT,
+        error_root: Path = ERROR_RECORD_ROOT,
         parent: Optional[QtCore.QObject] = None,
     ) -> None:
         super().__init__(parent)
         self.camera_controller = camera_controller
         self.calibration_provider = calibration_provider
         self.port = port
+        self.error_root = error_root
         self.server = QtNetwork.QTcpServer(self)
         self.current_client: Optional[QtNetwork.QTcpSocket] = None
         self.client_buffers: Dict[QtNetwork.QTcpSocket, bytearray] = {}
-        self.capture_queue: Deque[Tuple[str, Path]] = deque()
-        self.active_capture: Optional[Tuple[str, Path]] = None
-        self.pending_responses: Deque[str] = deque()
+        self.client_sessions: Dict[QtNetwork.QTcpSocket, int] = {}
+        self.next_session_id = 1
+        self.current_session_id: Optional[int] = None
+        self.capture_queue: Deque[CaptureJob] = deque()
+        self.active_capture: Optional[CaptureJob] = None
 
         self.server.newConnection.connect(self.accept_connection)
         self.camera_controller.status_changed.connect(self.camera_status_changed)
@@ -288,7 +316,9 @@ class Vt6TrainingServer(QtCore.QObject):
         for client in list(self.client_buffers):
             client.deleteLater()
         self.client_buffers.clear()
+        self.client_sessions.clear()
         self.current_client = None
+        self.current_session_id = None
         self.server.close()
 
     @QtCore.pyqtSlot()
@@ -301,6 +331,10 @@ class Vt6TrainingServer(QtCore.QObject):
             previous_client = self.current_client
             self.current_client = new_client
             self.client_buffers[new_client] = bytearray()
+            session_id = self.next_session_id
+            self.next_session_id += 1
+            self.client_sessions[new_client] = session_id
+            self.current_session_id = session_id
             new_client.readyRead.connect(
                 lambda client=new_client: self.read_client(client)
             )
@@ -312,12 +346,13 @@ class Vt6TrainingServer(QtCore.QObject):
                 previous_client.abort()
 
         self.status_changed.emit("VT6已连接", True)
-        self.flush_pending_responses()
 
     def client_disconnected(self, client: QtNetwork.QTcpSocket) -> None:
         self.client_buffers.pop(client, None)
+        self.client_sessions.pop(client, None)
         if self.current_client is client:
             self.current_client = None
+            self.current_session_id = None
             if self.server.isListening():
                 self.status_changed.emit(f"VT6等待连接 :{self.port}", False)
         client.deleteLater()
@@ -336,13 +371,21 @@ class Vt6TrainingServer(QtCore.QObject):
             raw_line, remaining = buffer.split(b"\n", 1)
             buffer[:] = remaining
             command = raw_line.rstrip(b"\r").decode("ascii", errors="ignore")
-            self.handle_command(command.strip().upper())
+            self.handle_command(
+                command.strip().upper(), self.client_sessions.get(client)
+            )
 
-    def handle_command(self, command: str) -> None:
+    def handle_command(
+        self, command: str, response_session: Optional[int] = None
+    ) -> None:
+        if not command:
+            return
         if command == "CALIB":
-            self.send_response(self.format_calibration())
+            self.send_response(self.format_calibration(), response_session)
         elif command in {"INNER", "GLUE"}:
-            self.enqueue_capture(command)
+            self.enqueue_capture(command, response_session)
+        else:
+            self.enqueue_error_record(command)
 
     def format_calibration(self) -> str:
         calibration = self.calibration_provider()
@@ -353,18 +396,54 @@ class Vt6TrainingServer(QtCore.QObject):
                 values.append(f"{value:+.2f}")
         return ",".join(values)
 
-    def enqueue_capture(self, command: str) -> None:
+    def enqueue_capture(
+        self, command: str, response_session: Optional[int] = None
+    ) -> None:
         if not self.camera_controller.ready:
-            self.send_response(f"{command},NG")
+            self.send_response(f"{command},NG", response_session)
             return
         if len(self.capture_queue) >= MAX_CAPTURE_QUEUE:
-            self.send_response(f"{command},NG")
+            self.send_response(f"{command},NG", response_session)
             return
 
         self.capture_queue.append(
-            (command, build_capture_path(category=command))
+            (command, build_capture_path(category=command), None, response_session)
         )
         self.start_next_capture()
+
+    def enqueue_error_record(self, error_code: str) -> None:
+        output_path = build_error_capture_path(error_code, root=self.error_root)
+        self.append_error_log(error_code, output_path, "RECEIVED")
+
+        if not self.camera_controller.ready:
+            self.append_error_log(error_code, output_path, "CAMERA_NOT_READY")
+            return
+        if len(self.capture_queue) >= MAX_CAPTURE_QUEUE:
+            self.append_error_log(error_code, output_path, "CAPTURE_QUEUE_FULL")
+            return
+
+        # Fault images have priority over queued training captures. An active
+        # exposure is allowed to finish before this capture starts.
+        self.capture_queue.appendleft((None, output_path, error_code, None))
+        self.start_next_capture()
+
+    def append_error_log(
+        self,
+        error_code: str,
+        output_path: Path,
+        status: str,
+    ) -> None:
+        recorded_at = datetime.now().isoformat(timespec="milliseconds")
+        clean_code = error_code.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+        clean_status = status.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+        try:
+            self.error_root.mkdir(parents=True, exist_ok=True)
+            with (self.error_root / "error.log").open("a", encoding="utf-8") as log_file:
+                log_file.write(
+                    f"{recorded_at}\t{clean_code}\t{clean_status}\t{output_path.name}\n"
+                )
+        except OSError as error:
+            print(f"Unable to write RPi error log: {error}", file=sys.stderr)
 
     def start_next_capture(self) -> None:
         if (
@@ -389,37 +468,59 @@ class Vt6TrainingServer(QtCore.QObject):
     @QtCore.pyqtSlot(str)
     def capture_succeeded(self, path_text: str) -> None:
         if self.active_capture is not None and self.active_capture[1] == Path(path_text):
-            command, _path = self.active_capture
+            response_command, _path, _error_code, response_session = (
+                self.active_capture
+            )
             self.active_capture = None
 
             # Training stage: every successfully captured image is saved and is OK.
-            self.send_response(f"{command},OK")
+            if response_command is not None:
+                self.send_response(
+                    f"{response_command},OK", response_session
+                )
         self.start_next_capture()
 
     @QtCore.pyqtSlot(str)
-    def capture_failed(self, _error_message: str) -> None:
+    def capture_failed(self, error_message: str) -> None:
         if self.active_capture is not None:
-            command, _path = self.active_capture
+            response_command, output_path, error_code, response_session = (
+                self.active_capture
+            )
             self.active_capture = None
-            self.send_response(f"{command},NG")
+            if response_command is not None:
+                self.send_response(
+                    f"{response_command},NG", response_session
+                )
+            elif error_code is not None:
+                self.append_error_log(
+                    error_code,
+                    output_path,
+                    f"CAPTURE_FAILED: {error_message}",
+                )
         self.start_next_capture()
 
-    def send_response(self, response: str) -> None:
-        if not self.write_current(response):
-            self.pending_responses.append(response)
+    def send_response(
+        self, response: str, response_session: Optional[int] = None
+    ) -> bool:
+        """Reply only on the connection that issued the request.
 
-    def flush_pending_responses(self) -> None:
-        while self.pending_responses:
-            response = self.pending_responses[0]
-            if not self.write_current(response):
-                return
-            self.pending_responses.popleft()
+        The VT6 never waits for a reply. If that connection has already gone
+        away, the result is intentionally dropped instead of being replayed to
+        a later production cycle.
+        """
+        return self.write_current(response, response_session)
 
-    def write_current(self, response: str) -> bool:
+    def write_current(
+        self, response: str, response_session: Optional[int] = None
+    ) -> bool:
         client = self.current_client
         if (
             client is None
             or client.state() != QtNetwork.QAbstractSocket.ConnectedState
+            or (
+                response_session is not None
+                and response_session != self.current_session_id
+            )
         ):
             return False
         client.write((response + "\r\n").encode("ascii"))

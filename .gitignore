@@ -14,7 +14,7 @@ Thumbs.db
 *.pt
 *_ncnn_model/
 captures/
+error_records/
 runs/
 data/
 models/
-
