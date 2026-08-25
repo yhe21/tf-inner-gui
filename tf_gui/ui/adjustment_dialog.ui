@@ -17,7 +17,7 @@
    </size>
   </property>
   <property name="windowTitle">
-   <string>调整</string>
+   <string>Adjustment</string>
   </property>
   <layout class="QVBoxLayout" name="mainLayout">
    <property name="spacing">
@@ -40,7 +40,7 @@
      <item>
       <widget class="QLabel" name="lblDialogTitle">
        <property name="text">
-        <string>调整</string>
+        <string>Adjustment</string>
        </property>
       </widget>
      </item>
@@ -60,7 +60,7 @@
      <item>
       <widget class="QLabel" name="lblStep">
        <property name="text">
-        <string>固定步长：0.05 mm / 0.05°</string>
+        <string>Fixed step: 0.05 mm / 0.05 deg</string>
        </property>
       </widget>
      </item>
@@ -99,15 +99,15 @@
    </item>
    <item>
     <widget class="QLabel" name="lblRangeInfo">
-     <property name="text"><string>允许范围：−0.50 ～ +0.50　　点击“应用”后保存</string></property>
+     <property name="text"><string>Allowed range: -0.50 to +0.50    Tap Apply to save</string></property>
      <property name="alignment"><set>Qt::AlignCenter</set></property>
     </widget>
    </item>
    <item>
     <layout class="QHBoxLayout" name="actionLayout">
      <item><spacer name="actionSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
-     <item><widget class="QPushButton" name="btnCancel"><property name="minimumSize"><size><width>160</width><height>58</height></size></property><property name="text"><string>取消</string></property></widget></item>
-     <item><widget class="QPushButton" name="btnApply"><property name="minimumSize"><size><width>180</width><height>58</height></size></property><property name="text"><string>应用并保存</string></property></widget></item>
+     <item><widget class="QPushButton" name="btnCancel"><property name="minimumSize"><size><width>160</width><height>58</height></size></property><property name="text"><string>Cancel</string></property></widget></item>
+     <item><widget class="QPushButton" name="btnApply"><property name="minimumSize"><size><width>180</width><height>58</height></size></property><property name="text"><string>Apply and Save</string></property></widget></item>
     </layout>
    </item>
   </layout>

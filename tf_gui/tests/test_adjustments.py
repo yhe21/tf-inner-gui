@@ -92,20 +92,32 @@ class AdjustmentTests(unittest.TestCase):
     def test_camera_page_loads_without_picamera_on_pc(self) -> None:
         controller = CameraController()
         dialog = CameraMonitorDialog(controller)
-        self.assertEqual(dialog.btnManualCapture.text(), "手动拍摄并保存")
+        self.assertEqual(dialog.btnManualCapture.text(), "Capture and Save")
         self.assertFalse(dialog.capture_is_running())
+
+    def test_runtime_and_ui_files_have_no_chinese_menu_text(self) -> None:
+        interface_files = [PROJECT_DIR / "main.py"]
+        interface_files.extend((PROJECT_DIR / "ui").glob("*.ui"))
+        for interface_file in interface_files:
+            self.assertNotRegex(
+                interface_file.read_text(encoding="utf-8"),
+                r"[\u4e00-\u9fff]",
+                msg=f"Chinese UI text remains in {interface_file.name}",
+            )
 
     def test_persistent_worker_captures_a_fresh_frame_and_releases_it(self) -> None:
         class FakeRequest:
             def __init__(self) -> None:
                 self.released = False
                 self.saved_stream = None
+                self.saved_paths = []
 
             def get_metadata(self):
                 return {"SensorTimestamp": 123456789}
 
             def save(self, stream_name, path_text):
                 self.saved_stream = stream_name
+                self.saved_paths.append(path_text)
                 Path(path_text).write_bytes(b"fake-jpeg")
 
             def release(self):
@@ -146,19 +158,35 @@ class AdjustmentTests(unittest.TestCase):
         acquired = []
         succeeded = []
         worker.frame_acquired.connect(
-            lambda path, timestamp: acquired.append((path, timestamp))
+            lambda path, timestamp, saved: acquired.append(
+                (path, timestamp, saved)
+            )
         )
-        worker.succeeded.connect(succeeded.append)
+        worker.succeeded.connect(
+            lambda path, saved: succeeded.append((path, saved))
+        )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_path = Path(temporary_directory) / "capture.jpg"
+            transient_path = Path(temporary_directory) / "transient.jpg"
             worker.request_capture(output_path)
+            worker.request_capture(transient_path, save_image=False)
             worker.stop()
             worker.run()
 
             self.assertTrue(output_path.exists())
-            self.assertEqual(succeeded, [str(output_path)])
-            self.assertEqual(acquired, [(str(output_path), 123456789)])
+            self.assertFalse(transient_path.exists())
+            self.assertEqual(
+                succeeded,
+                [(str(output_path), True), (str(transient_path), False)],
+            )
+            self.assertEqual(
+                acquired,
+                [
+                    (str(output_path), 123456789, True),
+                    (str(transient_path), 123456789, False),
+                ],
+            )
 
         options = fake_camera.configuration_options
         self.assertEqual(options["main"]["size"], fake_camera.sensor_resolution)
@@ -166,18 +194,19 @@ class AdjustmentTests(unittest.TestCase):
         self.assertFalse(options["queue"])
         self.assertTrue(fake_camera.flush_value)
         self.assertEqual(fake_camera.request.saved_stream, "main")
+        self.assertEqual(fake_camera.request.saved_paths, [str(output_path)])
         self.assertTrue(fake_camera.request.released)
         self.assertTrue(fake_camera.stopped)
         self.assertTrue(fake_camera.closed)
 
-    def test_vt6_training_commands_return_calibration_and_ok_results(self) -> None:
+    def test_vt6_commands_capture_without_saving_and_return_results(self) -> None:
         controller = CameraController()
         controller.ready = True
-        captured_paths = []
+        captured_jobs = []
 
-        def capture(output_path):
+        def capture(output_path, save_image=True):
             controller.busy = True
-            captured_paths.append(output_path)
+            captured_jobs.append((output_path, save_image))
             return True
 
         controller.capture = capture
@@ -204,20 +233,22 @@ class AdjustmentTests(unittest.TestCase):
 
         client.write(b"INNER\r\nGLUE\r\n")
         client.flush()
-        self.assertTrue(self.wait_until(lambda: len(captured_paths) == 1))
-        self.assertEqual(captured_paths[0].parent.name, "INNER")
+        self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 1))
+        self.assertEqual(captured_jobs[0][0].parent.name, "INNER")
+        self.assertFalse(captured_jobs[0][1])
 
-        controller.on_capture_succeeded(str(captured_paths[0]))
+        controller.on_capture_succeeded(str(captured_jobs[0][0]), False)
         self.assertEqual(self.read_response(client), "INNER,OK")
-        self.assertTrue(self.wait_until(lambda: len(captured_paths) == 2))
-        self.assertEqual(captured_paths[1].parent.name, "GLUE")
+        self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 2))
+        self.assertEqual(captured_jobs[1][0].parent.name, "GLUE")
+        self.assertFalse(captured_jobs[1][1])
 
-        controller.on_capture_succeeded(str(captured_paths[1]))
+        controller.on_capture_succeeded(str(captured_jobs[1][0]), False)
         self.assertEqual(self.read_response(client), "GLUE,OK")
 
         client.write(b"INNER\r\n")
         client.flush()
-        self.assertTrue(self.wait_until(lambda: len(captured_paths) == 3))
+        self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 3))
         client.disconnectFromHost()
         self.assertTrue(self.wait_until(lambda: server.current_client is None))
 
@@ -230,7 +261,7 @@ class AdjustmentTests(unittest.TestCase):
 
         # The old exposure may finish after a new production connection is
         # established. Its result must not be delivered to the new session.
-        controller.on_capture_succeeded(str(captured_paths[2]))
+        controller.on_capture_succeeded(str(captured_jobs[2][0]), False)
         self.assertFalse(reconnected_client.waitForReadyRead(100))
 
         reconnected_client.disconnectFromHost()
@@ -239,11 +270,11 @@ class AdjustmentTests(unittest.TestCase):
     def test_unknown_command_is_logged_and_queues_fault_photo_without_reply(self) -> None:
         controller = CameraController()
         controller.ready = True
-        captured_paths = []
+        captured_jobs = []
 
-        def capture(output_path):
+        def capture(output_path, save_image=True):
             controller.busy = True
-            captured_paths.append(output_path)
+            captured_jobs.append((output_path, save_image))
             return True
 
         controller.capture = capture
@@ -259,18 +290,20 @@ class AdjustmentTests(unittest.TestCase):
 
             server.handle_command("PICK_NP_NO_VAC")
 
-            self.assertEqual(len(captured_paths), 1)
-            self.assertEqual(captured_paths[0].parent, error_root)
-            self.assertIn("PICK_NP_NO_VAC", captured_paths[0].name)
+            self.assertEqual(len(captured_jobs), 1)
+            captured_path, save_image = captured_jobs[0]
+            self.assertTrue(save_image)
+            self.assertEqual(captured_path.parent, error_root)
+            self.assertIn("PICK_NP_NO_VAC", captured_path.name)
 
             log_path = error_root / "error.log"
             self.assertTrue(log_path.exists())
             log_text = log_path.read_text(encoding="utf-8")
             self.assertIn("PICK_NP_NO_VAC", log_text)
             self.assertIn("RECEIVED", log_text)
-            self.assertIn(captured_paths[0].name, log_text)
+            self.assertIn(captured_path.name, log_text)
 
-            controller.on_capture_succeeded(str(captured_paths[0]))
+            controller.on_capture_succeeded(str(captured_path), True)
 
     @classmethod
     def wait_until(cls, condition, timeout_seconds=1.0):

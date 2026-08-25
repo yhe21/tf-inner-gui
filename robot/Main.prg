@@ -7,7 +7,8 @@ Integer Mcount, conveyorCount
 Boolean MainTool, firstLoc
 Global Preserve Real temp_cnt_hmi, tot_cnt_hmi
 Real NPX, NPY, NPZ, NPU, NPSX, NPSY, NPSZ, NPSU, DROPX, DROPY, DROPZ, DROPU
-Global Boolean RpiConnected, RpiFatalPending, RpiFatalSent
+Global Boolean RpiConnected, RpiFatalPending
+Global Integer RpiFatalSent
 Global String RpiFatalMessage$
 Function main
 	'Call pallet_build
@@ -38,18 +39,18 @@ Function RpiNet
 	String response$
 	String fields$(0)
 	
-	' This task is the only owner of TCP port #201.
+	' This task is the only owner of Epson TCP/IP configuration port #202.
 	OnErr GoTo NetError
 	
 NetReconnect:
 	RpiConnected = False
-	CloseNet #201
+	CloseNet #202
 	Wait 0.2
-	OpenNet #201 As Client
-	WaitNet #201, 2
-	netState = ChkNet(201)
+	OpenNet #202 As Client
+	WaitNet #202, 2
+	netState = ChkNet(202)
 	If netState < 0 Then
-		CloseNet #201
+		CloseNet #202
 		Wait 1
 		GoTo NetReconnect
 	EndIf
@@ -58,51 +59,51 @@ NetReconnect:
 	RpiConnected = True
 	
 	Do
-		netState = ChkNet(201)
+		netState = ChkNet(202)
 		If netState < 0 Then
 			GoTo NetDisconnected
 		EndIf
 		
 		' One shared fatal-message channel replaces separate error I/O bits.
 		If RpiFatalPending = True Then
-			Print #201, RpiFatalMessage$
+			Print #202, RpiFatalMessage$
 			RpiFatalPending = False
-			RpiFatalSent = True
+			RpiFatalSent = 1
 		EndIf
 		
 		' CALIB has priority because Pick_NP uses these values.
 		If MemSw(RpiCalibReq) = On Then
-			Print #201, "CALIB"
+			Print #202, "CALIB"
 			MemOff RpiCalibReq
 		EndIf
 		
 		If MemSw(RpiInnerReq) = On Then
-			Print #201, "INNER"
+			Print #202, "INNER"
 			MemOff RpiInnerReq
 		EndIf
 		
 		If MemSw(RpiGlueReq) = On Then
-			Print #201, "GLUE"
+			Print #202, "GLUE"
 			MemOff RpiGlueReq
 		EndIf
 		
 		' Read only complete CR/LF terminated lines, so this loop never
 		' blocks robot motion while YOLO is still processing an image.
-		If Lof(201) > 0 Then
-			Line Input #201, response$
+		If Lof(202) > 0 Then
+			Line Input #202, response$
 			response$ = UCase$(Trim$(response$))
 			
 			Select response$
 			Case "INNER,OK"
 				Print "INNER OK"
 			Case "INNER,NG"
-				Print #201, "NO_INNER"
+				Print #202, "NO_INNER"
 				Wait 0.05
 				Quit All
 			Case "GLUE,OK"
 				Print "GLUE OK"
 			Case "GLUE,NG"
-				Print #201, "NO_GLUE"
+				Print #202, "NO_GLUE"
 				Wait 0.05
 				Quit All
 			Default
@@ -158,7 +159,7 @@ NetReconnect:
 NetDisconnected:
 	RpiConnected = False
 	Print "RPi TCP disconnected; reconnecting"
-	CloseNet #201
+	CloseNet #202
 	Wait 1
 	GoTo NetReconnect
 	
@@ -171,10 +172,10 @@ Function FatalError(errorCode$ As String)
 	' Best-effort logging only: RPi must never prevent the robot stopping.
 	Print errorCode$
 	RpiFatalMessage$ = UCase$(errorCode$)
-	RpiFatalSent = False
+	RpiFatalSent = 0
 	If RpiConnected = True Then
 		RpiFatalPending = True
-		Wait RpiFatalSent = True, 0.2
+		Wait RpiFatalSent = 1, 0.2
 		If TW = True Then
 			Print "Unable to send error to Raspberry Pi: ", errorCode$
 		EndIf
@@ -213,7 +214,7 @@ Function Init
 	MemOff RpiCalibReq
 	RpiConnected = False
 	RpiFatalPending = False
-	RpiFatalSent = False
+	RpiFatalSent = 0
 	RpiFatalMessage$ = ""
 	
 	' TCP is optional. RpiNet reconnects in the background and main continues.

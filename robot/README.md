@@ -1,12 +1,15 @@
 # VT6 / Raspberry Pi communication setup
 
 `Main.prg` is the TF program with all Raspberry Pi socket access isolated in
-`RpiNet`. Configure Epson TCP/IP port `#201` in the controller instead of
+`RpiNet`. Configure Epson TCP/IP port `#202` in the controller instead of
 hard-coding an address in SPEL+:
 
 - Mode used by the program: Client
-- Host: Raspberry Pi wired IPv4 address, for example `192.168.50.20`
+- Host: Raspberry Pi wired IPv4 address: `192.168.0.20`
 - TCP port: `5000`
+
+The Epson controller is currently `192.168.0.21/24`, so both devices are on
+the same wired subnet.
 
 Create only these three Memory I/O labels on unused bit numbers in Epson RC+:
 
@@ -34,7 +37,7 @@ NP_X,NP_Y,NP_Z,NP_U,NPS_X,NPS_Y,NPS_Z,NPS_U,DROP_X,DROP_Y,DROP_Z,DROP_U
 ```
 
 The Raspberry Pi protocol must terminate every command and response with
-CR/LF. `Print #201` and `Line Input #201` provide that line-based interface.
+CR/LF. `Print #202` and `Line Input #202` provide that line-based interface.
 
 All fatal robot paths call `FatalError` with one text code. It uses one shared
 internal message slot instead of more Memory I/O bits, lets `RpiNet` send the

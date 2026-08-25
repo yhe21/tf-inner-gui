@@ -25,6 +25,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
+APP_VERSION = "0.2.0"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -35,9 +36,10 @@ DEFAULT_ADJUSTMENTS = {
     station: {axis: 0.0 for axis in AXES} for station in STATIONS
 }
 
+CaptureCommand = Tuple[Path, bool]
 # response_session identifies the TCP connection that issued a capture request.
 # A result from an old connection must never be delivered to a new connection.
-CaptureJob = Tuple[Optional[str], Path, Optional[str], Optional[int]]
+CaptureJob = Tuple[Optional[str], Path, Optional[str], Optional[int], bool]
 
 
 def build_capture_path(
@@ -96,9 +98,9 @@ class CaptureWorker(QtCore.QObject):
 
     ready = QtCore.pyqtSignal(int, int)
     initialization_failed = QtCore.pyqtSignal(str)
-    capture_started = QtCore.pyqtSignal(str)
-    frame_acquired = QtCore.pyqtSignal(str, int)
-    succeeded = QtCore.pyqtSignal(str)
+    capture_started = QtCore.pyqtSignal(str, bool)
+    frame_acquired = QtCore.pyqtSignal(str, int, bool)
+    succeeded = QtCore.pyqtSignal(str, bool)
     failed = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
 
@@ -110,11 +112,11 @@ class CaptureWorker(QtCore.QObject):
         super().__init__()
         self.camera_factory = camera_factory
         self.warmup_seconds = warmup_seconds
-        self.commands: "queue.Queue[Optional[Path]]" = queue.Queue()
+        self.commands: "queue.Queue[Optional[CaptureCommand]]" = queue.Queue()
 
-    def request_capture(self, output_path: Path) -> None:
+    def request_capture(self, output_path: Path, save_image: bool = True) -> None:
         """Thread-safe: enqueue a capture without touching the camera object."""
-        self.commands.put(output_path)
+        self.commands.put((output_path, save_image))
 
     def stop(self) -> None:
         """Thread-safe: finish the current capture, then close the camera."""
@@ -139,11 +141,12 @@ class CaptureWorker(QtCore.QObject):
             self.ready.emit(*native_resolution)
 
             while True:
-                output_path = self.commands.get()
-                if output_path is None:
+                command = self.commands.get()
+                if command is None:
                     break
-                self.capture_started.emit(str(output_path))
-                self.capture_one(camera, output_path)
+                output_path, save_image = command
+                self.capture_started.emit(str(output_path), save_image)
+                self.capture_one(camera, output_path, save_image)
         except Exception as error:  # Picamera2 raises several backend exceptions.
             self.initialization_failed.emit(str(error))
         finally:
@@ -154,18 +157,24 @@ class CaptureWorker(QtCore.QObject):
                     camera.close()
             self.stopped.emit()
 
-    def capture_one(self, camera: object, output_path: Path) -> None:
+    def capture_one(
+        self, camera: object, output_path: Path, save_image: bool
+    ) -> None:
         request = None
         try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if save_image:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
 
             # flush=True guarantees that exposure starts no earlier than trigger time.
             request = camera.capture_request(flush=True)
             metadata = request.get_metadata()
             sensor_timestamp = int(metadata.get("SensorTimestamp", 0))
-            self.frame_acquired.emit(str(output_path), sensor_timestamp)
-            request.save("main", str(output_path))
-            self.succeeded.emit(str(output_path))
+            self.frame_acquired.emit(
+                str(output_path), sensor_timestamp, save_image
+            )
+            if save_image:
+                request.save("main", str(output_path))
+            self.succeeded.emit(str(output_path), save_image)
         except Exception as error:
             self.failed.emit(str(error))
         finally:
@@ -178,9 +187,9 @@ class CameraController(QtCore.QObject):
     """Application-wide camera service shared by GUI and future TCP triggers."""
 
     status_changed = QtCore.pyqtSignal(str, bool)
-    capture_started = QtCore.pyqtSignal(str)
-    frame_acquired = QtCore.pyqtSignal(str, int)
-    capture_succeeded = QtCore.pyqtSignal(str)
+    capture_started = QtCore.pyqtSignal(str, bool)
+    frame_acquired = QtCore.pyqtSignal(str, int, bool)
+    capture_succeeded = QtCore.pyqtSignal(str, bool)
     capture_failed = QtCore.pyqtSignal(str)
 
     def __init__(
@@ -194,7 +203,7 @@ class CameraController(QtCore.QObject):
         self.worker: Optional[CaptureWorker] = None
         self.ready = False
         self.busy = False
-        self.status_text = "摄像头正在启动……"
+        self.status_text = "Camera starting..."
 
     def start(self) -> None:
         if self.thread is not None and self.thread.isRunning():
@@ -202,7 +211,7 @@ class CameraController(QtCore.QObject):
 
         self.ready = False
         self.busy = False
-        self.status_text = "摄像头正在启动……"
+        self.status_text = "Camera starting..."
         self.status_changed.emit(self.status_text, False)
 
         self.thread = QtCore.QThread(self)
@@ -222,11 +231,11 @@ class CameraController(QtCore.QObject):
         self.thread.finished.connect(self.on_thread_finished)
         self.thread.start()
 
-    def capture(self, output_path: Path) -> bool:
+    def capture(self, output_path: Path, save_image: bool = True) -> bool:
         if not self.ready or self.busy or self.worker is None:
             return False
         self.busy = True
-        self.worker.request_capture(output_path)
+        self.worker.request_capture(output_path, save_image)
         return True
 
     def stop(self, timeout_ms: int = 5000) -> bool:
@@ -242,20 +251,20 @@ class CameraController(QtCore.QObject):
     @QtCore.pyqtSlot(int, int)
     def on_ready(self, width: int, height: int) -> None:
         self.ready = True
-        self.status_text = f"Camera 就绪 {width}×{height}"
+        self.status_text = f"Camera ready {width}x{height}"
         self.status_changed.emit(self.status_text, True)
 
     @QtCore.pyqtSlot(str)
     def on_initialization_failed(self, error_message: str) -> None:
         self.ready = False
         self.busy = False
-        self.status_text = f"Camera 错误：{error_message}"
+        self.status_text = f"Camera error: {error_message}"
         self.status_changed.emit(self.status_text, False)
 
-    @QtCore.pyqtSlot(str)
-    def on_capture_succeeded(self, path_text: str) -> None:
+    @QtCore.pyqtSlot(str, bool)
+    def on_capture_succeeded(self, path_text: str, saved: bool) -> None:
         self.busy = False
-        self.capture_succeeded.emit(path_text)
+        self.capture_succeeded.emit(path_text, saved)
 
     @QtCore.pyqtSlot(str)
     def on_capture_failed(self, error_message: str) -> None:
@@ -269,7 +278,7 @@ class CameraController(QtCore.QObject):
 
 
 class Vt6TrainingServer(QtCore.QObject):
-    """Minimal VT6 protocol used while collecting INNER and GLUE images."""
+    """Non-blocking VT6 trigger, calibration, and fault-record protocol."""
 
     status_changed = QtCore.pyqtSignal(str, bool)
 
@@ -303,11 +312,11 @@ class Vt6TrainingServer(QtCore.QObject):
     def start(self) -> bool:
         if not self.server.listen(QtNetwork.QHostAddress.AnyIPv4, self.port):
             self.status_changed.emit(
-                f"VT6端口错误：{self.server.errorString()}", False
+                f"VT6 port error: {self.server.errorString()}", False
             )
             return False
         self.port = int(self.server.serverPort())
-        self.status_changed.emit(f"VT6等待连接 :{self.port}", False)
+        self.status_changed.emit(f"VT6 waiting on port {self.port}", False)
         return True
 
     def stop(self) -> None:
@@ -345,7 +354,7 @@ class Vt6TrainingServer(QtCore.QObject):
             if previous_client is not None and previous_client is not new_client:
                 previous_client.abort()
 
-        self.status_changed.emit("VT6已连接", True)
+        self.status_changed.emit("VT6 connected", True)
 
     def client_disconnected(self, client: QtNetwork.QTcpSocket) -> None:
         self.client_buffers.pop(client, None)
@@ -354,7 +363,9 @@ class Vt6TrainingServer(QtCore.QObject):
             self.current_client = None
             self.current_session_id = None
             if self.server.isListening():
-                self.status_changed.emit(f"VT6等待连接 :{self.port}", False)
+                self.status_changed.emit(
+                    f"VT6 waiting on port {self.port}", False
+                )
         client.deleteLater()
 
     def read_client(self, client: QtNetwork.QTcpSocket) -> None:
@@ -407,7 +418,13 @@ class Vt6TrainingServer(QtCore.QObject):
             return
 
         self.capture_queue.append(
-            (command, build_capture_path(category=command), None, response_session)
+            (
+                command,
+                build_capture_path(category=command),
+                None,
+                response_session,
+                False,
+            )
         )
         self.start_next_capture()
 
@@ -422,9 +439,11 @@ class Vt6TrainingServer(QtCore.QObject):
             self.append_error_log(error_code, output_path, "CAPTURE_QUEUE_FULL")
             return
 
-        # Fault images have priority over queued training captures. An active
+        # Fault images have priority over queued production captures. An active
         # exposure is allowed to finish before this capture starts.
-        self.capture_queue.appendleft((None, output_path, error_code, None))
+        self.capture_queue.appendleft(
+            (None, output_path, error_code, None, True)
+        )
         self.start_next_capture()
 
     def append_error_log(
@@ -455,7 +474,7 @@ class Vt6TrainingServer(QtCore.QObject):
             return
 
         job = self.capture_queue.popleft()
-        if self.camera_controller.capture(job[1]):
+        if self.camera_controller.capture(job[1], save_image=job[4]):
             self.active_capture = job
         else:
             self.capture_queue.appendleft(job)
@@ -465,15 +484,19 @@ class Vt6TrainingServer(QtCore.QObject):
         if is_ready:
             self.start_next_capture()
 
-    @QtCore.pyqtSlot(str)
-    def capture_succeeded(self, path_text: str) -> None:
+    @QtCore.pyqtSlot(str, bool)
+    def capture_succeeded(self, path_text: str, _saved: bool) -> None:
         if self.active_capture is not None and self.active_capture[1] == Path(path_text):
-            response_command, _path, _error_code, response_session = (
-                self.active_capture
-            )
+            (
+                response_command,
+                _path,
+                _error_code,
+                response_session,
+                _save_image,
+            ) = self.active_capture
             self.active_capture = None
 
-            # Training stage: every successfully captured image is saved and is OK.
+            # Current production stage: acquisition succeeds without saving.
             if response_command is not None:
                 self.send_response(
                     f"{response_command},OK", response_session
@@ -483,9 +506,13 @@ class Vt6TrainingServer(QtCore.QObject):
     @QtCore.pyqtSlot(str)
     def capture_failed(self, error_message: str) -> None:
         if self.active_capture is not None:
-            response_command, output_path, error_code, response_session = (
-                self.active_capture
-            )
+            (
+                response_command,
+                output_path,
+                error_code,
+                response_session,
+                _save_image,
+            ) = self.active_capture
             self.active_capture = None
             if response_command is not None:
                 self.send_response(
@@ -562,11 +589,15 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
         output_path = build_capture_path()
         if not self.camera_controller.capture(output_path):
-            self.lblCameraPageStatus.setText("摄像头尚未就绪，请稍候再试")
+            self.lblCameraPageStatus.setText(
+                "Camera is not ready. Please wait and try again."
+            )
             self.refresh_buttons()
             return
 
-        self.lblCameraPageStatus.setText("已收到触发，正在获取新帧……")
+        self.lblCameraPageStatus.setText(
+            "Trigger received. Acquiring a fresh frame..."
+        )
         self.refresh_buttons()
 
     @QtCore.pyqtSlot(str, bool)
@@ -574,30 +605,49 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.lblCameraPageStatus.setText(status_text)
         self.refresh_buttons()
 
-    @QtCore.pyqtSlot(str)
-    def capture_started(self, _path_text: str) -> None:
-        self.lblCameraPageStatus.setText("正在曝光并读取图像……")
+    @QtCore.pyqtSlot(str, bool)
+    def capture_started(self, _path_text: str, save_image: bool) -> None:
+        if save_image:
+            status = "Exposing and reading image..."
+        else:
+            status = "Acquiring production frame (not saving)..."
+        self.lblCameraPageStatus.setText(status)
         self.refresh_buttons()
 
-    @QtCore.pyqtSlot(str, int)
-    def frame_acquired(self, _path_text: str, _sensor_timestamp: int) -> None:
-        self.lblCameraPageStatus.setText("图像已采集，正在保存 JPG……")
+    @QtCore.pyqtSlot(str, int, bool)
+    def frame_acquired(
+        self, _path_text: str, _sensor_timestamp: int, save_image: bool
+    ) -> None:
+        if save_image:
+            status = "Frame acquired. Saving JPG..."
+        else:
+            status = "Production frame acquired. No file was saved."
+        self.lblCameraPageStatus.setText(status)
 
-    @QtCore.pyqtSlot(str)
-    def capture_succeeded(self, path_text: str) -> None:
+    @QtCore.pyqtSlot(str, bool)
+    def capture_succeeded(self, path_text: str, saved: bool) -> None:
+        if not saved:
+            self.lblCameraPageStatus.setText(
+                "Production frame captured successfully (not saved)."
+            )
+            self.refresh_buttons()
+            return
+
         self.last_capture_path = Path(path_text)
         self.show_captured_image(self.last_capture_path)
         relative_path = self.last_capture_path.relative_to(APP_DIR)
-        self.lblCameraPageStatus.setText(f"拍摄成功，已保存：{relative_path}")
+        self.lblCameraPageStatus.setText(f"Capture saved: {relative_path}")
 
     @QtCore.pyqtSlot(str)
     def capture_failed(self, error_message: str) -> None:
-        self.lblCameraPageStatus.setText("拍摄失败，请检查摄像头连接")
+        self.lblCameraPageStatus.setText(
+            "Capture failed. Check the camera connection."
+        )
         self.refresh_buttons()
         QtWidgets.QMessageBox.critical(
             self,
-            "拍摄失败",
-            f"无法从摄像头获取图片：\n{error_message}",
+            "Capture Failed",
+            f"Unable to acquire an image from the camera:\n{error_message}",
         )
 
     def refresh_buttons(self) -> None:
@@ -615,7 +665,9 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             reader.setScaledSize(image_size)
         image = reader.read()
         if image.isNull():
-            self.lblCapturedImage.setText("图片已保存，但预览加载失败")
+            self.lblCapturedImage.setText(
+                "Image saved, but the preview could not be loaded."
+            )
             return
 
         self.lblCapturedImage.setPixmap(QtGui.QPixmap.fromImage(image))
@@ -642,8 +694,8 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         if self.capture_is_running():
             QtWidgets.QMessageBox.information(
                 self,
-                "正在拍摄",
-                "请等待当前照片保存完成后再返回。",
+                "Capture in Progress",
+                "Wait for the current capture to finish before going back.",
             )
             return
         super().reject()
@@ -653,8 +705,8 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             event.ignore()
             QtWidgets.QMessageBox.information(
                 self,
-                "正在拍摄",
-                "请等待当前照片保存完成后再关闭窗口。",
+                "Capture in Progress",
+                "Wait for the current capture to finish before closing.",
             )
             return
         super().closeEvent(event)
@@ -732,9 +784,9 @@ class AdjustmentDialog(QtWidgets.QDialog):
             axis: normalize_value(saved_values.get(axis, 0.0)) for axis in AXES
         }
 
-        self.setWindowTitle(f"{station} 调整")
-        self.lblDialogTitle.setText(f"{station} 调整")
-        self.lblStep.setText("固定步长：0.05 mm / 0.05°")
+        self.setWindowTitle(f"{station} Adjustment")
+        self.lblDialogTitle.setText(f"{station} Adjustment")
+        self.lblStep.setText("Fixed step: 0.05 mm / 0.05 deg")
 
         for axis in AXES:
             minus_button = getattr(self, f"btn{axis}Minus")
@@ -783,6 +835,8 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         super().__init__()
         uic.loadUi(str(UI_FILE), self)
+        self.setWindowTitle(f"TF Inner Inspection System v{APP_VERSION}")
+        self.lblTitle.setText(f"TF Inner Inspection v{APP_VERSION}")
 
         if STYLE_FILE.exists():
             self.setStyleSheet(STYLE_FILE.read_text(encoding="utf-8"))
@@ -794,8 +848,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.adjustments = deepcopy(DEFAULT_ADJUSTMENTS)
             QtWidgets.QMessageBox.warning(
                 self,
-                "读取调整数据失败",
-                f"无法读取或创建调整数据文件：\n{error}",
+                "Adjustment Data Error",
+                f"Unable to read or create the adjustment file:\n{error}",
             )
 
         self.btnCameraMonitor.clicked.connect(self.open_camera_monitor)
@@ -813,13 +867,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.vt6_server = Vt6TrainingServer(
                 self.camera_controller,
                 lambda: self.adjustments,
-                tcp_port,
-                self,
+                port=tcp_port,
+                parent=self,
             )
             self.vt6_server.status_changed.connect(self.update_vt6_status)
             self.vt6_server.start()
         else:
-            self.update_vt6_status("VT6服务已关闭", False)
+            self.update_vt6_status("VT6 service disabled", False)
 
         self.clock_timer = QtCore.QTimer(self)
         self.clock_timer.timeout.connect(self.update_clock)
@@ -845,7 +899,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def select_page(self, page_name: str) -> None:
         # The actual pages will replace this message in the next development step.
-        self.lblFooter.setText(f"已选择：{page_name}（页面功能待接入）")
+        self.lblFooter.setText(f"Selected: {page_name} (page not implemented)")
 
     def open_camera_monitor(self) -> None:
         dialog = CameraMonitorDialog(self.camera_controller, self)
@@ -854,7 +908,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.exec_()
         if dialog.last_capture_path is not None:
             relative_path = dialog.last_capture_path.relative_to(APP_DIR)
-            self.lblFooter.setText(f"最近拍摄：{relative_path}")
+            self.lblFooter.setText(f"Latest capture: {relative_path}")
 
     def open_adjustment(self, station: str) -> None:
         dialog = AdjustmentDialog(station, self.adjustments[station], self)
@@ -862,7 +916,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dialog.setWindowState(dialog.windowState() | QtCore.Qt.WindowFullScreen)
 
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
-            self.lblFooter.setText(f"{station}：已取消，数据未更改")
+            self.lblFooter.setText(f"{station}: canceled; values unchanged")
             return
 
         previous_values = self.adjustments[station]
@@ -873,22 +927,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.adjustments[station] = previous_values
             QtWidgets.QMessageBox.critical(
                 self,
-                "保存失败",
-                f"调整数据没有保存：\n{error}",
+                "Save Failed",
+                f"Adjustment values were not saved:\n{error}",
             )
-            self.lblFooter.setText(f"{station}：保存失败")
+            self.lblFooter.setText(f"{station}: save failed")
             return
 
         summary = "  ".join(
             f"{axis} {value:+.2f}" for axis, value in self.adjustments[station].items()
         )
-        self.lblFooter.setText(f"{station} 已保存：{summary}")
+        self.lblFooter.setText(f"{station} saved: {summary}")
 
     def confirm_exit(self) -> None:
         answer = QtWidgets.QMessageBox.question(
             self,
-            "退出系统",
-            "确定要关闭操作界面吗？",
+            "Exit System",
+            "Close the operator interface?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
@@ -902,8 +956,8 @@ class MainWindow(QtWidgets.QMainWindow):
             event.ignore()
             QtWidgets.QMessageBox.warning(
                 self,
-                "摄像头仍在工作",
-                "摄像头正在完成当前任务，请稍后再次退出。",
+                "Camera Busy",
+                "The camera is finishing a task. Try exiting again shortly.",
             )
             return
         super().closeEvent(event)
@@ -911,6 +965,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TF Inner touch-screen GUI")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {APP_VERSION}"
+    )
     parser.add_argument(
         "--fullscreen",
         action="store_true",

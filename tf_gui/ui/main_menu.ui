@@ -17,7 +17,7 @@
    </size>
   </property>
   <property name="windowTitle">
-   <string>TF Inner 检测系统</string>
+   <string>TF Inner Inspection System</string>
   </property>
   <widget class="QWidget" name="centralWidget">
    <layout class="QVBoxLayout" name="mainLayout" stretch="0,1,0">
@@ -63,7 +63,7 @@
        <item>
         <widget class="QLabel" name="lblTitle">
          <property name="text">
-          <string>TF Inner 检测系统</string>
+          <string>TF Inner Inspection System</string>
          </property>
         </widget>
        </item>
@@ -86,7 +86,7 @@
           <bool>false</bool>
          </property>
          <property name="text">
-          <string>● VT6 未连接</string>
+          <string>● VT6 Disconnected</string>
          </property>
         </widget>
        </item>
@@ -96,7 +96,7 @@
           <bool>false</bool>
          </property>
          <property name="text">
-          <string>● Camera 待机</string>
+          <string>● Camera Standby</string>
          </property>
         </widget>
        </item>
@@ -139,7 +139,7 @@
          <bool>true</bool>
         </property>
         <property name="text">
-         <string>摄像头结果监测</string>
+         <string>Camera Results</string>
         </property>
        </widget>
       </item>
@@ -155,7 +155,7 @@
          <bool>true</bool>
         </property>
         <property name="text">
-         <string>PickNP 调整</string>
+         <string>PickNP Adjustment</string>
         </property>
        </widget>
       </item>
@@ -171,7 +171,7 @@
          <bool>true</bool>
         </property>
         <property name="text">
-         <string>PickNPS 调整</string>
+         <string>PickNPS Adjustment</string>
         </property>
        </widget>
       </item>
@@ -187,7 +187,7 @@
          <bool>true</bool>
         </property>
         <property name="text">
-         <string>DropNP 调整</string>
+         <string>DropNP Adjustment</string>
         </property>
        </widget>
       </item>
@@ -214,7 +214,7 @@
        <item>
         <widget class="QLabel" name="lblFooter">
          <property name="text">
-          <string>请选择要进入的功能</string>
+          <string>Select a function</string>
          </property>
         </widget>
        </item>
@@ -240,7 +240,7 @@
           </size>
          </property>
          <property name="text">
-          <string>退出系统</string>
+          <string>Exit</string>
          </property>
         </widget>
        </item>
