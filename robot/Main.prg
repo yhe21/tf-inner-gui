@@ -39,7 +39,7 @@ Function RpiNet
 	String response$
 	String fields$(0)
 	
-	' This task is the only owner of Epson TCP/IP configuration port #202.
+	' This task is the only owner of TCP port #202.
 	OnErr GoTo NetError
 	
 NetReconnect:
@@ -75,6 +75,7 @@ NetReconnect:
 		If MemSw(RpiCalibReq) = On Then
 			Print #202, "CALIB"
 			MemOff RpiCalibReq
+
 		EndIf
 		
 		If MemSw(RpiInnerReq) = On Then
@@ -85,6 +86,11 @@ NetReconnect:
 		If MemSw(RpiGlueReq) = On Then
 			Print #202, "GLUE"
 			MemOff RpiGlueReq
+		EndIf
+
+		If MemSw(RpiNpReq) = On Then
+			Print #202, "NP"
+			MemOff RpiNpReq
 		EndIf
 		
 		' Read only complete CR/LF terminated lines, so this loop never
@@ -104,6 +110,12 @@ NetReconnect:
 				Print "GLUE OK"
 			Case "GLUE,NG"
 				Print #202, "NO_GLUE"
+				Wait 0.05
+				Quit All
+			Case "NP,OK"
+				Print "NP OK"
+			Case "NP,NG"
+				Print #202, "NO_NP"
 				Wait 0.05
 				Quit All
 			Default
@@ -143,10 +155,12 @@ NetReconnect:
 							Case 11
 								DROPU = calibValues(i)
 							Send
+
 						Else
 							Print "Ignored CALIB value outside +/-0.5: ", fields$(i)
 						EndIf
 					Next i
+					Print "calib OK"
 				Else
 					Print "Empty RPi response ignored"
 				EndIf
@@ -208,9 +222,10 @@ Function Power_Low
 	AccelS 1000, 1000
 Fend
 Function Init
-	' Only the three command request bits are exposed as Memory I/O.
+	' Only the four command request bits are exposed as Memory I/O.
 	MemOff RpiInnerReq
 	MemOff RpiGlueReq
+	MemOff RpiNpReq
 	MemOff RpiCalibReq
 	RpiConnected = False
 	RpiFatalPending = False
@@ -462,14 +477,15 @@ Function Drop_NP
 	' Glue is visible now. Trigger GLUE before placing the NP.
 	MemOn RpiGlueReq
 	
-	Power_High
-	Move P_Drop_NP +X(DROPX) +Y(DROPY) +Z(10 + DROPZ) +U(DROPU) +W(-5) +X(3) CP
-	Move P_Drop_NP +X(DROPX) +Y(DROPY) +Z(3.5 + DROPZ) +U(DROPU) +W(-5) +X(2.2); '
-	Move P_Drop_NP +X(DROPX) +Y(DROPY) +Z(2.5 + DROPZ) +U(DROPU) +W(-5) +X(4.2); '
-	Move P_Drop_NP +X(2.2 + DROPX) +Y(DROPY) +Z(1.3 + DROPZ) +U(DROPU) ROT ! D20; Off vacuumSol1; Off vacuumSol2; !
-	Move P_Drop_NP +X(3 + DROPX) +Y(DROPY) +Z(2.5 + DROPZ) +U(DROPU) CP
+	Power_Mid
+	Move P_Drop_NP +X(3 + DROPX) +Y(-0.5 + DROPY) +Z(10 + DROPZ) +U(DROPU) +W(-5) CP
+	Move P_Drop_NP +X(2 + DROPX) +Y(-0.5 + DROPY) +Z(3.5 + DROPZ) +U(DROPU) +W(-5); '
+	Move P_Drop_NP +X(4.2 + DROPX) +Y(0.8 + DROPY) +Z(2.5 + DROPZ) +U(DROPU) +W(-5); '
+	Move P_Drop_NP +X(2.2 + DROPX + 1) +Y(0.8 + DROPY) +Z(0.3 + DROPZ) +U(0.15 + DROPU) ROT ! D50; Off vacuumSol1; Off vacuumSol2; !
+	Move P_Drop_NP +X(3 + DROPX) +Y(DROPY) +Z(0 + DROPZ) +U(0.15 + DROPU)
 	'Move P_Drop_NP +Z(3) CP
-	Move P_Drop_NP +W(-1) +Z(25) ! D50; On finishedDropNP !
+	Move P_Drop_NP +W(0) +Z(25) ! D50; On finishedDropNP !
+	Power_High
 	
 Fend
 Function Pick_Fixture
@@ -480,6 +496,9 @@ Function Pick_Fixture
 			FatalError "PICK_FIXTURE_WAIT_TIMEOUT"
 		EndIf
 	EndIf
+	' The assembled NP is visible and stationary. Trigger before pickup motion.
+	MemOn RpiNpReq
+
 	Off finishedDropNP
 	Move P_Drop_NP +X(DROPX) +Y(DROPY) +Z(3 + DROPZ) +U(DROPU)
 	On vacuumSol1

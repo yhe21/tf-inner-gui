@@ -1,10 +1,10 @@
 # TF Inner GUI
 
-当前版本：`v0.2.2`。触摸屏菜单和运行状态均使用英文。
+当前版本：`v0.2.3`。触摸屏菜单和运行状态均使用英文。
 
 本版本的主要行为：
 
-- `INNER`和`GLUE`默认保存原生分辨率训练图片；
+- `INNER`、`GLUE`和`NP`默认保存原生分辨率训练图片；
 - `Camera Results`页面可以随时开启或关闭训练图片保存；
 - `Capture and Save`手动按钮仍保存原生分辨率 JPG，并将像素顺时针旋转 90°；
 - 机器人故障代码仍保存统一日志和故障照片；
@@ -26,7 +26,7 @@ X/Y/Z/U 调整数值，固定步长为 0.05，允许范围为 -0.50～+0.50。
 
 程序每次启动都会自动读取该文件；点击“取消”不会改变已保存的数据。
 
-`Camera Results`页面的`Save INNER/GLUE images for training`选项用于控制生产触发
+`Camera Results`页面的`Save INNER/GLUE/NP images for training`选项用于控制生产触发
 图片是否保存。默认开启，修改后立即生效，并保存在：
 
 ```text
@@ -59,15 +59,17 @@ captures/YYYYMMDD/YYYYMMDD_HHMMSS_mmm.jpg
 ```text
 INNER\r\n
 GLUE\r\n
+NP\r\n
 CALIB\r\n
 ```
 
-当前版本收到`INNER`或`GLUE`后，都会以原生分辨率完成一次新帧采集。训练图片保存
+当前版本收到`INNER`、`GLUE`或`NP`后，都会以原生分辨率完成一次新帧采集。训练图片保存
 默认开启，保存路径分别为：
 
 ```text
 captures/YYYYMMDD/INNER/YYYYMMDD_HHMMSS_mmm.jpg
 captures/YYYYMMDD/GLUE/YYYYMMDD_HHMMSS_mmm.jpg
+captures/YYYYMMDD/NP/YYYYMMDD_HHMMSS_mmm.jpg
 ```
 
 保存的图片同样顺时针旋转 90°。关闭页面上的保存选项后仍会正常采集，但不编码或
@@ -76,9 +78,10 @@ captures/YYYYMMDD/GLUE/YYYYMMDD_HHMMSS_mmm.jpg
 ```text
 INNER,OK\r\n
 GLUE,OK\r\n
+NP,OK\r\n
 ```
 
-只有摄像头未就绪、队列已满或采集失败时才会返回`INNER,NG`或`GLUE,NG`。
+只有摄像头未就绪、队列已满或采集失败时才会返回`INNER,NG`、`GLUE,NG`或`NP,NG`。
 手动拍摄仍保存在`captures/YYYYMMDD/`。机器人故障字符串仍写入统一日志并在
 `error_records/`中保存顺时针旋转 90° 的故障照片。正式检测阶段将运行对应YOLO模型，NG保存
 图片，OK不保存图片。

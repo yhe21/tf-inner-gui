@@ -11,19 +11,20 @@ hard-coding an address in SPEL+:
 The Epson controller is currently `192.168.0.21/24`, so both devices are on
 the same wired subnet.
 
-Create only these three Memory I/O labels on unused bit numbers in Epson RC+:
+Create only these four Memory I/O labels on unused bit numbers in Epson RC+:
 
 | Label | Writer | Purpose |
 | --- | --- | --- |
 | `RpiInnerReq` | robot cycle | Request `INNER` capture |
 | `RpiGlueReq` | robot cycle | Request `GLUE` capture |
+| `RpiNpReq` | robot cycle | Request `NP` capture |
 | `RpiCalibReq` | robot cycle | Request the 12 calibration values |
 
 The robot never waits for Raspberry Pi availability. A request bit remains on
 while disconnected and is cleared only after `RpiNet` sends the corresponding
-command. `INNER` and `GLUE` results are read
+command. `INNER`, `GLUE`, and `NP` results are read
 asynchronously, so robot motion does not wait for image processing. An NG
-result becomes `NO_INNER` or `NO_GLUE`, is sent to the Raspberry Pi for fault
+result becomes `NO_INNER`, `NO_GLUE`, or `NO_NP`, is sent to the Raspberry Pi for fault
 logging, and then stops the robot program.
 
 `CALIB` is requested near the beginning of `Pick_Part`, but the robot does not
@@ -49,6 +50,7 @@ Current fault codes include:
 ```text
 NO_INNER
 NO_GLUE
+NO_NP
 NO_PART_FROM_CONVEYOR
 PICK_PART_NO_VAC
 PICK_PART_WAIT_TIMEOUT

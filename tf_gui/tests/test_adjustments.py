@@ -11,6 +11,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+REPOSITORY_DIR = PROJECT_DIR.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 from PyQt5 import QtNetwork, QtWidgets  # noqa: E402
@@ -127,6 +128,22 @@ class AdjustmentTests(unittest.TestCase):
                 r"[\u4e00-\u9fff]",
                 msg=f"Chinese UI text remains in {interface_file.name}",
             )
+
+    def test_epson_np_trigger_precedes_pick_fixture_motion(self) -> None:
+        program_text = (REPOSITORY_DIR / "robot" / "Main.prg").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('Print #202, "NP"', program_text)
+        self.assertIn('Case "NP,OK"', program_text)
+        self.assertIn('Case "NP,NG"', program_text)
+        self.assertIn("MemOff RpiNpReq", program_text)
+
+        pick_fixture = program_text.split("Function Pick_Fixture", 1)[1]
+        pick_fixture = pick_fixture.split("Fend", 1)[0]
+        self.assertLess(
+            pick_fixture.index("MemOn RpiNpReq"),
+            pick_fixture.index("Move P_Drop_NP"),
+        )
 
     def test_persistent_worker_captures_a_fresh_frame_and_releases_it(self) -> None:
         class FakeRequest:
@@ -307,7 +324,7 @@ class AdjustmentTests(unittest.TestCase):
             "-0.10,+0.00,+0.00,+0.10",
         )
 
-        client.write(b"INNER\r\nGLUE\r\n")
+        client.write(b"INNER\r\nGLUE\r\nNP\r\n")
         client.flush()
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 1))
         self.assertEqual(captured_jobs[0][0].parent.name, "INNER")
@@ -321,12 +338,18 @@ class AdjustmentTests(unittest.TestCase):
 
         controller.on_capture_succeeded(str(captured_jobs[1][0]), True)
         self.assertEqual(self.read_response(client), "GLUE,OK")
+        self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 3))
+        self.assertEqual(captured_jobs[2][0].parent.name, "NP")
+        self.assertTrue(captured_jobs[2][1])
+
+        controller.on_capture_succeeded(str(captured_jobs[2][0]), True)
+        self.assertEqual(self.read_response(client), "NP,OK")
 
         save_production_images[0] = False
         client.write(b"INNER\r\n")
         client.flush()
-        self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 3))
-        self.assertFalse(captured_jobs[2][1])
+        self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 4))
+        self.assertFalse(captured_jobs[3][1])
         client.disconnectFromHost()
         self.assertTrue(self.wait_until(lambda: server.current_client is None))
 
@@ -339,7 +362,7 @@ class AdjustmentTests(unittest.TestCase):
 
         # The old exposure may finish after a new production connection is
         # established. Its result must not be delivered to the new session.
-        controller.on_capture_succeeded(str(captured_jobs[2][0]), False)
+        controller.on_capture_succeeded(str(captured_jobs[3][0]), False)
         self.assertFalse(reconnected_client.waitForReadyRead(100))
 
         reconnected_client.disconnectFromHost()

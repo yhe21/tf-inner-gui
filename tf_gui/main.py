@@ -28,10 +28,11 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
+PRODUCTION_COMMANDS = ("INNER", "GLUE", "NP")
 STEP = 0.05
 MIN_VALUE = -0.50
 MAX_VALUE = 0.50
@@ -412,7 +413,7 @@ class Vt6TrainingServer(QtCore.QObject):
             return
         if command == "CALIB":
             self.send_response(self.format_calibration(), response_session)
-        elif command in {"INNER", "GLUE"}:
+        elif command in PRODUCTION_COMMANDS:
             self.enqueue_capture(command, response_session)
         else:
             self.enqueue_error_record(command)
@@ -611,7 +612,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.refresh_capture_mode()
         state_text = "enabled" if enabled else "disabled"
         self.lblCameraPageStatus.setText(
-            f"INNER/GLUE training image saving {state_text}."
+            f"INNER/GLUE/NP training image saving {state_text}."
         )
         self.production_save_changed.emit(enabled)
 
@@ -813,7 +814,7 @@ class AdjustmentStore:
 
 
 class CaptureSettingsStore:
-    """Persist whether VT6 INNER/GLUE captures are saved for training."""
+    """Persist whether VT6 production captures are saved for training."""
 
     def __init__(self, path: Path = CAPTURE_SETTINGS_FILE) -> None:
         self.path = path
