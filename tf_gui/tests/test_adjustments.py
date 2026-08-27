@@ -30,7 +30,7 @@ from main import (  # noqa: E402
     Vt6TrainingServer,
     build_capture_path,
     build_error_capture_path,
-    save_clockwise_rotated_jpeg,
+    save_counterclockwise_rotated_jpeg,
 )
 
 
@@ -241,8 +241,8 @@ class AdjustmentTests(unittest.TestCase):
         self.assertTrue(fake_camera.stopped)
         self.assertTrue(fake_camera.closed)
 
-    def test_saved_jpeg_is_rotated_90_degrees_clockwise(self) -> None:
-        rotate_270 = object()
+    def test_saved_jpeg_is_rotated_90_degrees_counterclockwise(self) -> None:
+        rotate_90 = object()
         calls = []
 
         class FakeRotatedImage:
@@ -263,7 +263,7 @@ class AdjustmentTests(unittest.TestCase):
         image_module = ModuleType("PIL.Image")
 
         class FakeTranspose:
-            ROTATE_270 = rotate_270
+            ROTATE_90 = rotate_90
 
         image_module.Transpose = FakeTranspose
         pil_module.Image = image_module
@@ -273,13 +273,13 @@ class AdjustmentTests(unittest.TestCase):
             sys.modules,
             {"PIL": pil_module, "PIL.Image": image_module},
         ):
-            save_clockwise_rotated_jpeg(FakeRequest(), output_path)
+            save_counterclockwise_rotated_jpeg(FakeRequest(), output_path)
 
         self.assertEqual(
             calls,
             [
                 ("make_image", "main"),
-                ("transpose", rotate_270),
+                ("transpose", rotate_90),
                 ("save", output_path, {"format": "JPEG", "quality": 95}),
             ],
         )

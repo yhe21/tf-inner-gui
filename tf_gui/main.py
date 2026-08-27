@@ -28,7 +28,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -98,12 +98,14 @@ def create_picamera2() -> object:
     return Picamera2()
 
 
-def save_clockwise_rotated_jpeg(request: object, output_path: Path) -> None:
-    """Rotate the captured pixels 90 degrees clockwise and encode one JPEG."""
+def save_counterclockwise_rotated_jpeg(
+    request: object, output_path: Path
+) -> None:
+    """Rotate captured pixels 90 degrees counterclockwise and encode JPEG."""
     from PIL import Image
 
     image = request.make_image("main")
-    rotated_image = image.transpose(Image.Transpose.ROTATE_270)
+    rotated_image = image.transpose(Image.Transpose.ROTATE_90)
     rotated_image.save(output_path, format="JPEG", quality=95)
 
 
@@ -122,7 +124,7 @@ class CaptureWorker(QtCore.QObject):
         self,
         camera_factory: Callable[[], object] = create_picamera2,
         warmup_seconds: float = 1.0,
-        image_saver: ImageSaver = save_clockwise_rotated_jpeg,
+        image_saver: ImageSaver = save_counterclockwise_rotated_jpeg,
     ) -> None:
         super().__init__()
         self.camera_factory = camera_factory
