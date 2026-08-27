@@ -243,6 +243,7 @@ QCheckBox#chkSaveProductionImages::indicator {
 }
 
 QPushButton#btnCameraBack,
+QPushButton#btnAutoExposure,
 QPushButton#btnManualCapture {
     border: none;
     border-radius: 10px;
@@ -260,6 +261,11 @@ QPushButton#btnManualCapture {
     background-color: #087f8c;
 }
 
+QPushButton#btnAutoExposure {
+    color: #ffffff;
+    background-color: #2367a8;
+}
+
 QPushButton#btnCameraBack:pressed {
     background-color: #c3ced8;
 }
@@ -268,7 +274,12 @@ QPushButton#btnManualCapture:pressed {
     background-color: #075d66;
 }
 
+QPushButton#btnAutoExposure:pressed {
+    background-color: #174a7b;
+}
+
 QPushButton#btnCameraBack:disabled,
+QPushButton#btnAutoExposure:disabled,
 QPushButton#btnManualCapture:disabled {
     color: #94a3b8;
     background-color: #dbe3ea;

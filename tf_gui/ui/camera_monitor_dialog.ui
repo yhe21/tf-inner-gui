@@ -81,11 +81,22 @@
    </widget>
    </item>
    <item>
-    <widget class="QCheckBox" name="chkSaveProductionImages">
-     <property name="minimumSize"><size><width>0</width><height>48</height></size></property>
-     <property name="text"><string>Save INNER/GLUE/NP images for training</string></property>
-     <property name="checked"><bool>true</bool></property>
-    </widget>
+    <layout class="QHBoxLayout" name="cameraSettingsLayout">
+     <property name="spacing"><number>14</number></property>
+     <item>
+      <widget class="QCheckBox" name="chkSaveProductionImages">
+       <property name="minimumSize"><size><width>0</width><height>48</height></size></property>
+       <property name="text"><string>Save INNER/GLUE/NP images for training</string></property>
+       <property name="checked"><bool>true</bool></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnAutoExposure">
+       <property name="minimumSize"><size><width>255</width><height>54</height></size></property>
+       <property name="text"><string>Auto Calibrate &amp; Lock</string></property>
+      </widget>
+     </item>
+    </layout>
    </item>
    <item>
     <layout class="QHBoxLayout" name="cameraActionLayout">

@@ -21,6 +21,7 @@ from main import (  # noqa: E402
     AdjustmentStore,
     CameraController,
     CameraMonitorDialog,
+    CameraSettingsStore,
     CaptureSettingsStore,
     CaptureWorker,
     CAMERA_BUFFER_COUNT,
@@ -118,6 +119,160 @@ class AdjustmentTests(unittest.TestCase):
             self.assertTrue(store.load())
             store.save(False)
             self.assertFalse(CaptureSettingsStore(path).load())
+
+    def test_camera_settings_are_external_validated_and_persisted(self) -> None:
+        settings = {
+            "exposure_time_us": 12500,
+            "analogue_gain": 1.75,
+            "colour_gains": [1.42, 1.68],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "camera_settings.json"
+            store = CameraSettingsStore(path)
+            self.assertIsNone(store.load())
+
+            store.save(settings)
+            self.assertEqual(CameraSettingsStore(path).load(), settings)
+
+            path.write_text('{"exposure_time_us": 0}', encoding="utf-8")
+            self.assertIsNone(CameraSettingsStore(path).load())
+
+    def test_auto_calibration_reads_metadata_then_locks_controls(self) -> None:
+        class FakeRequest:
+            def __init__(self) -> None:
+                self.released = False
+
+            def get_metadata(self):
+                return {
+                    "ExposureTime": 12000,
+                    "AnalogueGain": 1.25,
+                    "ColourGains": (1.70, 1.40),
+                }
+
+            def release(self):
+                self.released = True
+
+        class FakeCamera:
+            def __init__(self) -> None:
+                self.sensor_resolution = (4056, 3040)
+                self.request = FakeRequest()
+                self.controls = []
+
+            def create_still_configuration(self, **options):
+                return options
+
+            def configure(self, _configuration):
+                pass
+
+            def set_controls(self, controls):
+                self.controls.append(controls)
+
+            def start(self):
+                pass
+
+            def capture_request(self, flush):
+                self.flush = flush
+                return self.request
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        fake_camera = FakeCamera()
+        worker = CaptureWorker(
+            lambda: fake_camera,
+            warmup_seconds=0.0,
+            auto_calibration_seconds=0.0,
+            manual_settle_seconds=0.0,
+        )
+        ready_events = []
+        calibrated_settings = []
+        worker.ready.connect(
+            lambda width, height, locked: ready_events.append(
+                (width, height, locked)
+            )
+        )
+        worker.auto_calibration_succeeded.connect(calibrated_settings.append)
+
+        worker.request_auto_calibration()
+        worker.stop()
+        worker.run()
+
+        expected_settings = {
+            "exposure_time_us": 12000,
+            "analogue_gain": 1.25,
+            "colour_gains": [1.70, 1.40],
+        }
+        self.assertEqual(ready_events, [(4056, 3040, False)])
+        self.assertEqual(calibrated_settings, [expected_settings])
+        self.assertEqual(
+            fake_camera.controls,
+            [
+                {"AeEnable": True, "AwbEnable": True},
+                {
+                    "AeEnable": False,
+                    "AwbEnable": False,
+                    "ExposureTime": 12000,
+                    "AnalogueGain": 1.25,
+                    "ColourGains": (1.70, 1.40),
+                },
+            ],
+        )
+        self.assertTrue(fake_camera.flush)
+        self.assertTrue(fake_camera.request.released)
+
+    def test_saved_manual_controls_are_applied_before_camera_start(self) -> None:
+        events = []
+
+        class FakeCamera:
+            sensor_resolution = (4056, 3040)
+
+            def create_still_configuration(self, **options):
+                return options
+
+            def configure(self, _configuration):
+                events.append("configure")
+
+            def set_controls(self, controls):
+                events.append(("controls", controls))
+
+            def start(self):
+                events.append("start")
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        settings = {
+            "exposure_time_us": 8000,
+            "analogue_gain": 1.5,
+            "colour_gains": [1.3, 1.6],
+        }
+        worker = CaptureWorker(
+            FakeCamera,
+            warmup_seconds=0.0,
+            initial_camera_settings=settings,
+        )
+        ready_events = []
+        worker.ready.connect(
+            lambda width, height, locked: ready_events.append(
+                (width, height, locked)
+            )
+        )
+        worker.stop()
+        worker.run()
+
+        self.assertEqual(events[0], "configure")
+        self.assertEqual(events[1][0], "controls")
+        self.assertEqual(events[1][1]["AeEnable"], False)
+        self.assertEqual(events[1][1]["AwbEnable"], False)
+        self.assertEqual(events[1][1]["ExposureTime"], 8000)
+        self.assertEqual(events[2], "start")
+        self.assertEqual(ready_events, [(4056, 3040, True)])
 
     def test_runtime_and_ui_files_have_no_chinese_menu_text(self) -> None:
         interface_files = [PROJECT_DIR / "main.py"]

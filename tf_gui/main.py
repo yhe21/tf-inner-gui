@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import queue
 import sys
 import time
@@ -22,13 +23,16 @@ CONFIG_FILE = Path.home() / ".config" / "tf_inner" / "adjustments.json"
 CAPTURE_SETTINGS_FILE = (
     Path.home() / ".config" / "tf_inner" / "capture_settings.json"
 )
+CAMERA_SETTINGS_FILE = (
+    Path.home() / ".config" / "tf_inner" / "camera_settings.json"
+)
 CAPTURE_ROOT = APP_DIR / "captures"
 ERROR_RECORD_ROOT = APP_DIR / "error_records"
 CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.3.0"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -40,7 +44,7 @@ DEFAULT_ADJUSTMENTS = {
     station: {axis: 0.0 for axis in AXES} for station in STATIONS
 }
 
-CaptureCommand = Tuple[Path, bool]
+CaptureCommand = Tuple[str, Optional[Path], bool]
 ImageSaver = Callable[[object, Path], None]
 # response_session identifies the TCP connection that issued a capture request.
 # A result from an old connection must never be delivered to a new connection.
@@ -112,8 +116,11 @@ def save_counterclockwise_rotated_jpeg(
 class CaptureWorker(QtCore.QObject):
     """Own one continuously running Picamera2 instance in a worker thread."""
 
-    ready = QtCore.pyqtSignal(int, int)
+    ready = QtCore.pyqtSignal(int, int, bool)
     initialization_failed = QtCore.pyqtSignal(str)
+    auto_calibration_started = QtCore.pyqtSignal()
+    auto_calibration_succeeded = QtCore.pyqtSignal(object)
+    auto_calibration_failed = QtCore.pyqtSignal(str)
     capture_started = QtCore.pyqtSignal(str, bool)
     frame_acquired = QtCore.pyqtSignal(str, int, bool)
     succeeded = QtCore.pyqtSignal(str, bool)
@@ -125,16 +132,26 @@ class CaptureWorker(QtCore.QObject):
         camera_factory: Callable[[], object] = create_picamera2,
         warmup_seconds: float = 1.0,
         image_saver: ImageSaver = save_counterclockwise_rotated_jpeg,
+        initial_camera_settings: Optional[Dict[str, object]] = None,
+        auto_calibration_seconds: float = 2.0,
+        manual_settle_seconds: float = 0.5,
     ) -> None:
         super().__init__()
         self.camera_factory = camera_factory
         self.warmup_seconds = warmup_seconds
         self.image_saver = image_saver
+        self.camera_settings = deepcopy(initial_camera_settings)
+        self.auto_calibration_seconds = auto_calibration_seconds
+        self.manual_settle_seconds = manual_settle_seconds
         self.commands: "queue.Queue[Optional[CaptureCommand]]" = queue.Queue()
 
     def request_capture(self, output_path: Path, save_image: bool = True) -> None:
         """Thread-safe: enqueue a capture without touching the camera object."""
-        self.commands.put((output_path, save_image))
+        self.commands.put(("capture", output_path, save_image))
+
+    def request_auto_calibration(self) -> None:
+        """Thread-safe: run AE/AWB once, then lock the measured controls."""
+        self.commands.put(("auto_calibrate", None, False))
 
     def stop(self) -> None:
         """Thread-safe: finish the current capture, then close the camera."""
@@ -152,17 +169,28 @@ class CaptureWorker(QtCore.QObject):
                 queue=False,
             )
             camera.configure(configuration)
+            if self.camera_settings is not None:
+                camera.set_controls(self.manual_controls(self.camera_settings))
             camera.start()
 
-            # Auto-exposure and white balance settle once, not on every trigger.
+            # A saved manual configuration is active before the first frame.
+            # Without one, AE/AWB may run only so the operator can calibrate.
             time.sleep(self.warmup_seconds)
-            self.ready.emit(*native_resolution)
+            self.ready.emit(
+                *native_resolution, self.camera_settings is not None
+            )
 
             while True:
                 command = self.commands.get()
                 if command is None:
                     break
-                output_path, save_image = command
+                command_name, output_path, save_image = command
+                if command_name == "auto_calibrate":
+                    self.auto_calibrate(camera)
+                    continue
+                if output_path is None:
+                    self.failed.emit("Capture path is missing")
+                    continue
                 self.capture_started.emit(str(output_path), save_image)
                 self.capture_one(camera, output_path, save_image)
         except Exception as error:  # Picamera2 raises several backend exceptions.
@@ -174,6 +202,53 @@ class CaptureWorker(QtCore.QObject):
                 with suppress(Exception):
                     camera.close()
             self.stopped.emit()
+
+    @staticmethod
+    def manual_controls(settings: Dict[str, object]) -> Dict[str, object]:
+        colour_gains = settings["colour_gains"]
+        return {
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ExposureTime": int(settings["exposure_time_us"]),
+            "AnalogueGain": float(settings["analogue_gain"]),
+            "ColourGains": tuple(colour_gains),
+        }
+
+    def auto_calibrate(self, camera: object) -> None:
+        request = None
+        self.auto_calibration_started.emit()
+        try:
+            camera.set_controls({"AeEnable": True, "AwbEnable": True})
+            time.sleep(self.auto_calibration_seconds)
+            request = camera.capture_request(flush=True)
+            metadata = request.get_metadata()
+            colour_gains = metadata.get("ColourGains")
+            if not isinstance(colour_gains, (list, tuple)) or len(colour_gains) != 2:
+                raise RuntimeError("Camera did not report valid colour gains")
+
+            settings: Dict[str, object] = {
+                "exposure_time_us": int(metadata["ExposureTime"]),
+                "analogue_gain": float(metadata["AnalogueGain"]),
+                "colour_gains": [
+                    float(colour_gains[0]),
+                    float(colour_gains[1]),
+                ],
+            }
+            normalized_settings = CameraSettingsStore.normalize(settings)
+            if normalized_settings is None:
+                raise RuntimeError("Camera reported invalid exposure controls")
+            settings = normalized_settings
+            camera.set_controls(self.manual_controls(settings))
+            time.sleep(self.manual_settle_seconds)
+            self.camera_settings = settings
+            self.auto_calibration_succeeded.emit(deepcopy(settings))
+        except Exception as error:
+            self.camera_settings = None
+            self.auto_calibration_failed.emit(str(error))
+        finally:
+            if request is not None:
+                with suppress(Exception):
+                    request.release()
 
     def capture_one(
         self, camera: object, output_path: Path, save_image: bool
@@ -209,16 +284,27 @@ class CameraController(QtCore.QObject):
     frame_acquired = QtCore.pyqtSignal(str, int, bool)
     capture_succeeded = QtCore.pyqtSignal(str, bool)
     capture_failed = QtCore.pyqtSignal(str)
+    auto_calibration_started = QtCore.pyqtSignal()
+    auto_calibration_succeeded = QtCore.pyqtSignal(object)
+    auto_calibration_failed = QtCore.pyqtSignal(str)
+    camera_settings_changed = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
         parent: Optional[QtCore.QObject] = None,
-        worker_factory: Callable[[], CaptureWorker] = CaptureWorker,
+        worker_factory: Optional[Callable[[], CaptureWorker]] = None,
+        initial_camera_settings: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__(parent)
-        self.worker_factory = worker_factory
+        self.camera_settings = deepcopy(initial_camera_settings)
+        self.worker_factory = worker_factory or (
+            lambda: CaptureWorker(
+                initial_camera_settings=deepcopy(self.camera_settings)
+            )
+        )
         self.thread: Optional[QtCore.QThread] = None
         self.worker: Optional[CaptureWorker] = None
+        self.camera_available = False
         self.ready = False
         self.busy = False
         self.status_text = "Camera starting..."
@@ -238,6 +324,15 @@ class CameraController(QtCore.QObject):
         self.thread.started.connect(self.worker.run)
         self.worker.ready.connect(self.on_ready)
         self.worker.initialization_failed.connect(self.on_initialization_failed)
+        self.worker.auto_calibration_started.connect(
+            self.on_auto_calibration_started
+        )
+        self.worker.auto_calibration_succeeded.connect(
+            self.on_auto_calibration_succeeded
+        )
+        self.worker.auto_calibration_failed.connect(
+            self.on_auto_calibration_failed
+        )
         self.worker.capture_started.connect(self.capture_started)
         self.worker.frame_acquired.connect(self.frame_acquired)
         self.worker.succeeded.connect(self.on_capture_succeeded)
@@ -256,27 +351,73 @@ class CameraController(QtCore.QObject):
         self.worker.request_capture(output_path, save_image)
         return True
 
+    def auto_calibrate(self) -> bool:
+        if not self.camera_available or self.busy or self.worker is None:
+            return False
+        self.busy = True
+        self.ready = False
+        self.worker.request_auto_calibration()
+        self.status_text = "Auto exposure and white balance calibrating..."
+        self.status_changed.emit(self.status_text, False)
+        return True
+
     def stop(self, timeout_ms: int = 5000) -> bool:
         if self.thread is None or not self.thread.isRunning():
             return True
         if self.worker is not None:
             self.worker.stop()
         stopped = self.thread.wait(timeout_ms)
+        self.camera_available = False
         self.ready = False
         self.busy = False
         return stopped
 
-    @QtCore.pyqtSlot(int, int)
-    def on_ready(self, width: int, height: int) -> None:
-        self.ready = True
-        self.status_text = f"Camera ready {width}x{height}"
-        self.status_changed.emit(self.status_text, True)
+    @QtCore.pyqtSlot(int, int, bool)
+    def on_ready(self, width: int, height: int, settings_locked: bool) -> None:
+        self.camera_available = True
+        self.ready = settings_locked
+        if settings_locked:
+            self.status_text = (
+                f"Camera ready {width}x{height} - manual exposure locked"
+            )
+        else:
+            self.status_text = (
+                f"Camera ready {width}x{height} - calibration required"
+            )
+        self.status_changed.emit(self.status_text, settings_locked)
 
     @QtCore.pyqtSlot(str)
     def on_initialization_failed(self, error_message: str) -> None:
+        self.camera_available = False
         self.ready = False
         self.busy = False
         self.status_text = f"Camera error: {error_message}"
+        self.status_changed.emit(self.status_text, False)
+
+    @QtCore.pyqtSlot()
+    def on_auto_calibration_started(self) -> None:
+        self.auto_calibration_started.emit()
+
+    @QtCore.pyqtSlot(object)
+    def on_auto_calibration_succeeded(
+        self, settings: Dict[str, object]
+    ) -> None:
+        self.camera_settings = deepcopy(settings)
+        self.camera_available = True
+        self.ready = True
+        self.busy = False
+        self.status_text = "Camera ready - manual exposure locked"
+        self.camera_settings_changed.emit(deepcopy(settings))
+        self.status_changed.emit(self.status_text, True)
+        self.auto_calibration_succeeded.emit(deepcopy(settings))
+
+    @QtCore.pyqtSlot(str)
+    def on_auto_calibration_failed(self, error_message: str) -> None:
+        self.camera_settings = None
+        self.ready = False
+        self.busy = False
+        self.status_text = f"Exposure calibration failed: {error_message}"
+        self.auto_calibration_failed.emit(error_message)
         self.status_changed.emit(self.status_text, False)
 
     @QtCore.pyqtSlot(str, bool)
@@ -291,6 +432,7 @@ class CameraController(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def on_thread_finished(self) -> None:
+        self.camera_available = False
         self.ready = False
         self.busy = False
 
@@ -594,6 +736,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
         self.chkSaveProductionImages.setChecked(production_save_enabled)
         self.btnManualCapture.clicked.connect(self.start_capture)
+        self.btnAutoExposure.clicked.connect(self.start_auto_calibration)
         self.btnCameraBack.clicked.connect(self.reject)
         self.chkSaveProductionImages.toggled.connect(
             self.production_save_toggled
@@ -604,6 +747,15 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.camera_controller.frame_acquired.connect(self.frame_acquired)
         self.camera_controller.capture_succeeded.connect(self.capture_succeeded)
         self.camera_controller.capture_failed.connect(self.capture_failed)
+        self.camera_controller.auto_calibration_started.connect(
+            self.auto_calibration_started
+        )
+        self.camera_controller.auto_calibration_succeeded.connect(
+            self.auto_calibration_succeeded
+        )
+        self.camera_controller.auto_calibration_failed.connect(
+            self.auto_calibration_failed
+        )
 
         self.lblCameraPageStatus.setText(self.camera_controller.status_text)
         self.refresh_capture_mode()
@@ -620,8 +772,16 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
     def refresh_capture_mode(self) -> None:
         state_text = "ON" if self.chkSaveProductionImages.isChecked() else "OFF"
+        settings = self.camera_controller.camera_settings
+        if settings is None:
+            exposure_text = "Calibration required"
+        else:
+            exposure_text = (
+                f"{int(settings['exposure_time_us'])} us | "
+                f"Gain {float(settings['analogue_gain']):.2f}"
+            )
         self.lblCaptureMode.setText(
-            f"Production saving {state_text} - Native resolution"
+            f"Production saving {state_text} | {exposure_text}"
         )
 
     def capture_is_running(self) -> bool:
@@ -657,6 +817,49 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             status = "Acquiring production frame (not saving)..."
         self.lblCameraPageStatus.setText(status)
         self.refresh_buttons()
+
+    def start_auto_calibration(self) -> None:
+        if self.capture_is_running():
+            return
+        if not self.camera_controller.auto_calibrate():
+            self.lblCameraPageStatus.setText(
+                "Camera is not available for calibration."
+            )
+            self.refresh_buttons()
+
+    @QtCore.pyqtSlot()
+    def auto_calibration_started(self) -> None:
+        self.lblCameraPageStatus.setText(
+            "Calibrating for 2 seconds. Keep the fixture and lighting steady..."
+        )
+        self.refresh_buttons()
+
+    @QtCore.pyqtSlot(object)
+    def auto_calibration_succeeded(
+        self, settings: Dict[str, object]
+    ) -> None:
+        colour_gains = settings["colour_gains"]
+        self.lblCameraPageStatus.setText(
+            "Locked and saved: "
+            f"{int(settings['exposure_time_us'])} us, "
+            f"gain {float(settings['analogue_gain']):.2f}, "
+            f"WB R {float(colour_gains[0]):.2f} / B {float(colour_gains[1]):.2f}"
+        )
+        self.refresh_capture_mode()
+        self.refresh_buttons()
+
+    @QtCore.pyqtSlot(str)
+    def auto_calibration_failed(self, error_message: str) -> None:
+        self.lblCameraPageStatus.setText(
+            "Calibration failed. Production triggers remain disabled."
+        )
+        self.refresh_capture_mode()
+        self.refresh_buttons()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Exposure Calibration Failed",
+            f"Unable to lock camera settings:\n{error_message}",
+        )
 
     @QtCore.pyqtSlot(str, int, bool)
     def frame_acquired(
@@ -698,6 +901,10 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.btnManualCapture.setEnabled(
             self.camera_controller.ready and not self.camera_controller.busy
         )
+        self.btnAutoExposure.setEnabled(
+            self.camera_controller.camera_available
+            and not self.camera_controller.busy
+        )
         self.btnCameraBack.setEnabled(not self.camera_controller.busy)
         self.chkSaveProductionImages.setEnabled(
             not self.camera_controller.busy
@@ -728,6 +935,18 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             (self.camera_controller.frame_acquired, self.frame_acquired),
             (self.camera_controller.capture_succeeded, self.capture_succeeded),
             (self.camera_controller.capture_failed, self.capture_failed),
+            (
+                self.camera_controller.auto_calibration_started,
+                self.auto_calibration_started,
+            ),
+            (
+                self.camera_controller.auto_calibration_succeeded,
+                self.auto_calibration_succeeded,
+            ),
+            (
+                self.camera_controller.auto_calibration_failed,
+                self.auto_calibration_failed,
+            ),
         )
         for signal, slot in connections:
             with suppress(TypeError):
@@ -849,6 +1068,68 @@ class CaptureSettingsStore:
         temporary_file.replace(self.path)
 
 
+class CameraSettingsStore:
+    """Persist the manually locked camera exposure and white balance."""
+
+    def __init__(self, path: Path = CAMERA_SETTINGS_FILE) -> None:
+        self.path = path
+
+    @staticmethod
+    def normalize(saved_data: object) -> Optional[Dict[str, object]]:
+        if not isinstance(saved_data, dict):
+            return None
+        try:
+            exposure_time_us = int(saved_data["exposure_time_us"])
+            analogue_gain = float(saved_data["analogue_gain"])
+            colour_gains = saved_data["colour_gains"]
+            if (
+                not isinstance(colour_gains, (list, tuple))
+                or len(colour_gains) != 2
+            ):
+                return None
+            red_gain = float(colour_gains[0])
+            blue_gain = float(colour_gains[1])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+        numeric_values = (
+            float(exposure_time_us),
+            analogue_gain,
+            red_gain,
+            blue_gain,
+        )
+        if exposure_time_us <= 0 or any(
+            value <= 0 or not math.isfinite(value) for value in numeric_values
+        ):
+            return None
+        return {
+            "exposure_time_us": exposure_time_us,
+            "analogue_gain": analogue_gain,
+            "colour_gains": [red_gain, blue_gain],
+        }
+
+    def load(self) -> Optional[Dict[str, object]]:
+        if not self.path.exists():
+            return None
+        try:
+            saved_data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return self.normalize(saved_data)
+
+    def save(self, settings: Dict[str, object]) -> None:
+        normalized = self.normalize(settings)
+        if normalized is None:
+            raise ValueError("Invalid camera settings")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = self.path.with_suffix(".tmp")
+        temporary_file.write_text(
+            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_file.replace(self.path)
+
+
 class AdjustmentDialog(QtWidgets.QDialog):
     """Touch-friendly offset editor shared by PickNP, PickNPS and DropNP."""
 
@@ -912,6 +1193,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         store: Optional[AdjustmentStore] = None,
         capture_settings_store: Optional[CaptureSettingsStore] = None,
+        camera_settings_store: Optional[CameraSettingsStore] = None,
         tcp_port: int = DEFAULT_TCP_PORT,
         tcp_enabled: bool = True,
     ) -> None:
@@ -926,6 +1208,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.store = store or AdjustmentStore()
         self.capture_settings_store = (
             capture_settings_store or CaptureSettingsStore()
+        )
+        self.camera_settings_store = (
+            camera_settings_store or CameraSettingsStore()
         )
         try:
             self.adjustments = self.store.load()
@@ -947,14 +1232,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Unable to read or create the capture settings file:\n{error}",
             )
 
+        try:
+            self.camera_settings = self.camera_settings_store.load()
+        except OSError as error:
+            self.camera_settings = None
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Camera Settings Error",
+                f"Unable to read the camera settings file:\n{error}",
+            )
+
         self.btnCameraMonitor.clicked.connect(self.open_camera_monitor)
         self.btnPickNP.clicked.connect(lambda: self.open_adjustment("PickNP"))
         self.btnPickNPS.clicked.connect(lambda: self.open_adjustment("PickNPS"))
         self.btnDropNP.clicked.connect(lambda: self.open_adjustment("DropNP"))
         self.btnExit.clicked.connect(self.confirm_exit)
 
-        self.camera_controller = CameraController(self)
+        self.camera_controller = CameraController(
+            self,
+            initial_camera_settings=self.camera_settings,
+        )
         self.camera_controller.status_changed.connect(self.update_camera_status)
+        self.camera_controller.camera_settings_changed.connect(
+            self.save_camera_settings
+        )
         self.camera_controller.start()
 
         self.vt6_server: Optional[Vt6TrainingServer] = None
@@ -1025,6 +1326,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
                 "Capture Settings Error",
                 "The setting is active for this session but could not be "
+                f"saved:\n{error}",
+            )
+
+    @QtCore.pyqtSlot(object)
+    def save_camera_settings(self, settings: Dict[str, object]) -> None:
+        self.camera_settings = deepcopy(settings)
+        try:
+            self.camera_settings_store.save(settings)
+        except (OSError, ValueError) as error:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Camera Settings Error",
+                "The exposure is locked for this session but could not be "
                 f"saved:\n{error}",
             )
 
