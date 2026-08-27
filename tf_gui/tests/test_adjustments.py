@@ -20,6 +20,7 @@ from main import (  # noqa: E402
     AdjustmentStore,
     CameraController,
     CameraMonitorDialog,
+    CaptureSettingsStore,
     CaptureWorker,
     CAMERA_BUFFER_COUNT,
     MAX_VALUE,
@@ -96,7 +97,26 @@ class AdjustmentTests(unittest.TestCase):
         controller = CameraController()
         dialog = CameraMonitorDialog(controller)
         self.assertEqual(dialog.btnManualCapture.text(), "Capture and Save")
+        self.assertTrue(dialog.chkSaveProductionImages.isChecked())
         self.assertFalse(dialog.capture_is_running())
+
+    def test_production_save_choice_is_emitted_and_persisted(self) -> None:
+        controller = CameraController()
+        dialog = CameraMonitorDialog(
+            controller, production_save_enabled=False
+        )
+        choices = []
+        dialog.production_save_changed.connect(choices.append)
+        dialog.chkSaveProductionImages.setChecked(True)
+        self.assertEqual(choices, [True])
+        self.assertIn("saving ON", dialog.lblCaptureMode.text())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "capture_settings.json"
+            store = CaptureSettingsStore(path)
+            self.assertTrue(store.load())
+            store.save(False)
+            self.assertFalse(CaptureSettingsStore(path).load())
 
     def test_runtime_and_ui_files_have_no_chinese_menu_text(self) -> None:
         interface_files = [PROJECT_DIR / "main.py"]
@@ -247,7 +267,7 @@ class AdjustmentTests(unittest.TestCase):
             ],
         )
 
-    def test_vt6_commands_capture_without_saving_and_return_results(self) -> None:
+    def test_vt6_commands_use_save_choice_and_return_results(self) -> None:
         controller = CameraController()
         controller.ready = True
         captured_jobs = []
@@ -263,7 +283,15 @@ class AdjustmentTests(unittest.TestCase):
             "PickNPS": {"X": 0.0, "Y": 0.0, "Z": 0.05, "U": -0.05},
             "DropNP": {"X": -0.10, "Y": 0.0, "Z": 0.0, "U": 0.10},
         }
-        server = Vt6TrainingServer(controller, lambda: calibration, port=0)
+        save_production_images = [True]
+        server = Vt6TrainingServer(
+            controller,
+            lambda: calibration,
+            port=0,
+            save_production_images_provider=(
+                lambda: save_production_images[0]
+            ),
+        )
         self.assertTrue(server.start())
 
         client = QtNetwork.QTcpSocket()
@@ -283,20 +311,22 @@ class AdjustmentTests(unittest.TestCase):
         client.flush()
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 1))
         self.assertEqual(captured_jobs[0][0].parent.name, "INNER")
-        self.assertFalse(captured_jobs[0][1])
+        self.assertTrue(captured_jobs[0][1])
 
-        controller.on_capture_succeeded(str(captured_jobs[0][0]), False)
+        controller.on_capture_succeeded(str(captured_jobs[0][0]), True)
         self.assertEqual(self.read_response(client), "INNER,OK")
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 2))
         self.assertEqual(captured_jobs[1][0].parent.name, "GLUE")
-        self.assertFalse(captured_jobs[1][1])
+        self.assertTrue(captured_jobs[1][1])
 
-        controller.on_capture_succeeded(str(captured_jobs[1][0]), False)
+        controller.on_capture_succeeded(str(captured_jobs[1][0]), True)
         self.assertEqual(self.read_response(client), "GLUE,OK")
 
+        save_production_images[0] = False
         client.write(b"INNER\r\n")
         client.flush()
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 3))
+        self.assertFalse(captured_jobs[2][1])
         client.disconnectFromHost()
         self.assertTrue(self.wait_until(lambda: server.current_client is None))
 

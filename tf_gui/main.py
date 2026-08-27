@@ -19,13 +19,16 @@ ADJUSTMENT_UI_FILE = APP_DIR / "ui" / "adjustment_dialog.ui"
 CAMERA_MONITOR_UI_FILE = APP_DIR / "ui" / "camera_monitor_dialog.ui"
 STYLE_FILE = APP_DIR / "styles" / "app.qss"
 CONFIG_FILE = Path.home() / ".config" / "tf_inner" / "adjustments.json"
+CAPTURE_SETTINGS_FILE = (
+    Path.home() / ".config" / "tf_inner" / "capture_settings.json"
+)
 CAPTURE_ROOT = APP_DIR / "captures"
 ERROR_RECORD_ROOT = APP_DIR / "error_records"
 CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -300,6 +303,7 @@ class Vt6TrainingServer(QtCore.QObject):
         calibration_provider: Callable[[], Dict[str, Dict[str, float]]],
         port: int = DEFAULT_TCP_PORT,
         error_root: Path = ERROR_RECORD_ROOT,
+        save_production_images_provider: Optional[Callable[[], bool]] = None,
         parent: Optional[QtCore.QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -307,6 +311,9 @@ class Vt6TrainingServer(QtCore.QObject):
         self.calibration_provider = calibration_provider
         self.port = port
         self.error_root = error_root
+        self.save_production_images_provider = (
+            save_production_images_provider or (lambda: True)
+        )
         self.server = QtNetwork.QTcpServer(self)
         self.current_client: Optional[QtNetwork.QTcpSocket] = None
         self.client_buffers: Dict[QtNetwork.QTcpSocket, bytearray] = {}
@@ -435,7 +442,7 @@ class Vt6TrainingServer(QtCore.QObject):
                 build_capture_path(category=command),
                 None,
                 response_session,
-                False,
+                bool(self.save_production_images_provider()),
             )
         )
         self.start_next_capture()
@@ -508,7 +515,6 @@ class Vt6TrainingServer(QtCore.QObject):
             ) = self.active_capture
             self.active_capture = None
 
-            # Current production stage: acquisition succeeds without saving.
             if response_command is not None:
                 self.send_response(
                     f"{response_command},OK", response_session
@@ -570,18 +576,25 @@ class Vt6TrainingServer(QtCore.QObject):
 class CameraMonitorDialog(QtWidgets.QDialog):
     """Camera page backed by the application-wide production camera service."""
 
+    production_save_changed = QtCore.pyqtSignal(bool)
+
     def __init__(
         self,
         camera_controller: CameraController,
         parent: Optional[QtWidgets.QWidget] = None,
+        production_save_enabled: bool = True,
     ) -> None:
         super().__init__(parent)
         uic.loadUi(str(CAMERA_MONITOR_UI_FILE), self)
         self.camera_controller = camera_controller
         self.last_capture_path: Optional[Path] = None
 
+        self.chkSaveProductionImages.setChecked(production_save_enabled)
         self.btnManualCapture.clicked.connect(self.start_capture)
         self.btnCameraBack.clicked.connect(self.reject)
+        self.chkSaveProductionImages.toggled.connect(
+            self.production_save_toggled
+        )
 
         self.camera_controller.status_changed.connect(self.camera_status_changed)
         self.camera_controller.capture_started.connect(self.capture_started)
@@ -590,7 +603,23 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.camera_controller.capture_failed.connect(self.capture_failed)
 
         self.lblCameraPageStatus.setText(self.camera_controller.status_text)
+        self.refresh_capture_mode()
         self.refresh_buttons()
+
+    @QtCore.pyqtSlot(bool)
+    def production_save_toggled(self, enabled: bool) -> None:
+        self.refresh_capture_mode()
+        state_text = "enabled" if enabled else "disabled"
+        self.lblCameraPageStatus.setText(
+            f"INNER/GLUE training image saving {state_text}."
+        )
+        self.production_save_changed.emit(enabled)
+
+    def refresh_capture_mode(self) -> None:
+        state_text = "ON" if self.chkSaveProductionImages.isChecked() else "OFF"
+        self.lblCaptureMode.setText(
+            f"Production saving {state_text} - Native resolution"
+        )
 
     def capture_is_running(self) -> bool:
         return self.camera_controller.busy
@@ -667,6 +696,9 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             self.camera_controller.ready and not self.camera_controller.busy
         )
         self.btnCameraBack.setEnabled(not self.camera_controller.busy)
+        self.chkSaveProductionImages.setEnabled(
+            not self.camera_controller.busy
+        )
 
     def show_captured_image(self, image_path: Path) -> None:
         reader = QtGui.QImageReader(str(image_path))
@@ -780,6 +812,40 @@ class AdjustmentStore:
         temporary_file.replace(self.path)
 
 
+class CaptureSettingsStore:
+    """Persist whether VT6 INNER/GLUE captures are saved for training."""
+
+    def __init__(self, path: Path = CAPTURE_SETTINGS_FILE) -> None:
+        self.path = path
+
+    def load(self) -> bool:
+        if not self.path.exists():
+            self.save(True)
+            return True
+
+        try:
+            saved_data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return True
+
+        saved_value = saved_data.get("save_training_images", True)
+        return saved_value if isinstance(saved_value, bool) else True
+
+    def save(self, enabled: bool) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = self.path.with_suffix(".tmp")
+        temporary_file.write_text(
+            json.dumps(
+                {"save_training_images": bool(enabled)},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary_file.replace(self.path)
+
+
 class AdjustmentDialog(QtWidgets.QDialog):
     """Touch-friendly offset editor shared by PickNP, PickNPS and DropNP."""
 
@@ -842,6 +908,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
         store: Optional[AdjustmentStore] = None,
+        capture_settings_store: Optional[CaptureSettingsStore] = None,
         tcp_port: int = DEFAULT_TCP_PORT,
         tcp_enabled: bool = True,
     ) -> None:
@@ -854,6 +921,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.setStyleSheet(STYLE_FILE.read_text(encoding="utf-8"))
 
         self.store = store or AdjustmentStore()
+        self.capture_settings_store = (
+            capture_settings_store or CaptureSettingsStore()
+        )
         try:
             self.adjustments = self.store.load()
         except OSError as error:
@@ -862,6 +932,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
                 "Adjustment Data Error",
                 f"Unable to read or create the adjustment file:\n{error}",
+            )
+
+        try:
+            self.save_training_images = self.capture_settings_store.load()
+        except OSError as error:
+            self.save_training_images = True
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Capture Settings Error",
+                f"Unable to read or create the capture settings file:\n{error}",
             )
 
         self.btnCameraMonitor.clicked.connect(self.open_camera_monitor)
@@ -880,6 +960,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.camera_controller,
                 lambda: self.adjustments,
                 port=tcp_port,
+                save_production_images_provider=(
+                    lambda: self.save_training_images
+                ),
                 parent=self,
             )
             self.vt6_server.status_changed.connect(self.update_vt6_status)
@@ -914,13 +997,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lblFooter.setText(f"Selected: {page_name} (page not implemented)")
 
     def open_camera_monitor(self) -> None:
-        dialog = CameraMonitorDialog(self.camera_controller, self)
+        dialog = CameraMonitorDialog(
+            self.camera_controller,
+            self,
+            production_save_enabled=self.save_training_images,
+        )
+        dialog.production_save_changed.connect(
+            self.set_production_image_saving
+        )
         if self.isFullScreen():
             dialog.setWindowState(dialog.windowState() | QtCore.Qt.WindowFullScreen)
         dialog.exec_()
         if dialog.last_capture_path is not None:
             relative_path = dialog.last_capture_path.relative_to(APP_DIR)
             self.lblFooter.setText(f"Latest capture: {relative_path}")
+
+    @QtCore.pyqtSlot(bool)
+    def set_production_image_saving(self, enabled: bool) -> None:
+        self.save_training_images = enabled
+        try:
+            self.capture_settings_store.save(enabled)
+        except OSError as error:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Capture Settings Error",
+                "The setting is active for this session but could not be "
+                f"saved:\n{error}",
+            )
 
     def open_adjustment(self, station: str) -> None:
         dialog = AdjustmentDialog(station, self.adjustments[station], self)
