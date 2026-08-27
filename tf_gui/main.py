@@ -25,7 +25,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -37,6 +37,7 @@ DEFAULT_ADJUSTMENTS = {
 }
 
 CaptureCommand = Tuple[Path, bool]
+ImageSaver = Callable[[object, Path], None]
 # response_session identifies the TCP connection that issued a capture request.
 # A result from an old connection must never be delivered to a new connection.
 CaptureJob = Tuple[Optional[str], Path, Optional[str], Optional[int], bool]
@@ -93,6 +94,15 @@ def create_picamera2() -> object:
     return Picamera2()
 
 
+def save_clockwise_rotated_jpeg(request: object, output_path: Path) -> None:
+    """Rotate the captured pixels 90 degrees clockwise and encode one JPEG."""
+    from PIL import Image
+
+    image = request.make_image("main")
+    rotated_image = image.transpose(Image.Transpose.ROTATE_270)
+    rotated_image.save(output_path, format="JPEG", quality=95)
+
+
 class CaptureWorker(QtCore.QObject):
     """Own one continuously running Picamera2 instance in a worker thread."""
 
@@ -108,10 +118,12 @@ class CaptureWorker(QtCore.QObject):
         self,
         camera_factory: Callable[[], object] = create_picamera2,
         warmup_seconds: float = 1.0,
+        image_saver: ImageSaver = save_clockwise_rotated_jpeg,
     ) -> None:
         super().__init__()
         self.camera_factory = camera_factory
         self.warmup_seconds = warmup_seconds
+        self.image_saver = image_saver
         self.commands: "queue.Queue[Optional[CaptureCommand]]" = queue.Queue()
 
     def request_capture(self, output_path: Path, save_image: bool = True) -> None:
@@ -173,7 +185,7 @@ class CaptureWorker(QtCore.QObject):
                 str(output_path), sensor_timestamp, save_image
             )
             if save_image:
-                request.save("main", str(output_path))
+                self.image_saver(request, output_path)
             self.succeeded.emit(str(output_path), save_image)
         except Exception as error:
             self.failed.emit(str(error))

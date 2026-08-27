@@ -5,6 +5,8 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
+from unittest import mock
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -26,6 +28,7 @@ from main import (  # noqa: E402
     Vt6TrainingServer,
     build_capture_path,
     build_error_capture_path,
+    save_clockwise_rotated_jpeg,
 )
 
 
@@ -109,16 +112,9 @@ class AdjustmentTests(unittest.TestCase):
         class FakeRequest:
             def __init__(self) -> None:
                 self.released = False
-                self.saved_stream = None
-                self.saved_paths = []
 
             def get_metadata(self):
                 return {"SensorTimestamp": 123456789}
-
-            def save(self, stream_name, path_text):
-                self.saved_stream = stream_name
-                self.saved_paths.append(path_text)
-                Path(path_text).write_bytes(b"fake-jpeg")
 
             def release(self):
                 self.released = True
@@ -154,7 +150,17 @@ class AdjustmentTests(unittest.TestCase):
                 self.closed = True
 
         fake_camera = FakeCamera()
-        worker = CaptureWorker(lambda: fake_camera, warmup_seconds=0.0)
+        saved_requests = []
+
+        def save_image(request, output_path):
+            saved_requests.append((request, output_path))
+            output_path.write_bytes(b"fake-jpeg")
+
+        worker = CaptureWorker(
+            lambda: fake_camera,
+            warmup_seconds=0.0,
+            image_saver=save_image,
+        )
         acquired = []
         succeeded = []
         worker.frame_acquired.connect(
@@ -193,11 +199,53 @@ class AdjustmentTests(unittest.TestCase):
         self.assertEqual(options["buffer_count"], CAMERA_BUFFER_COUNT)
         self.assertFalse(options["queue"])
         self.assertTrue(fake_camera.flush_value)
-        self.assertEqual(fake_camera.request.saved_stream, "main")
-        self.assertEqual(fake_camera.request.saved_paths, [str(output_path)])
+        self.assertEqual(saved_requests, [(fake_camera.request, output_path)])
         self.assertTrue(fake_camera.request.released)
         self.assertTrue(fake_camera.stopped)
         self.assertTrue(fake_camera.closed)
+
+    def test_saved_jpeg_is_rotated_90_degrees_clockwise(self) -> None:
+        rotate_270 = object()
+        calls = []
+
+        class FakeRotatedImage:
+            def save(self, output_path, **options):
+                calls.append(("save", output_path, options))
+
+        class FakeImage:
+            def transpose(self, method):
+                calls.append(("transpose", method))
+                return FakeRotatedImage()
+
+        class FakeRequest:
+            def make_image(self, stream_name):
+                calls.append(("make_image", stream_name))
+                return FakeImage()
+
+        pil_module = ModuleType("PIL")
+        image_module = ModuleType("PIL.Image")
+
+        class FakeTranspose:
+            ROTATE_270 = rotate_270
+
+        image_module.Transpose = FakeTranspose
+        pil_module.Image = image_module
+
+        output_path = Path("rotated.jpg")
+        with mock.patch.dict(
+            sys.modules,
+            {"PIL": pil_module, "PIL.Image": image_module},
+        ):
+            save_clockwise_rotated_jpeg(FakeRequest(), output_path)
+
+        self.assertEqual(
+            calls,
+            [
+                ("make_image", "main"),
+                ("transpose", rotate_270),
+                ("save", output_path, {"format": "JPEG", "quality": 95}),
+            ],
+        )
 
     def test_vt6_commands_capture_without_saving_and_return_results(self) -> None:
         controller = CameraController()
