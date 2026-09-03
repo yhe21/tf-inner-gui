@@ -1,15 +1,16 @@
 # TF Inner GUI
 
-当前版本：`v0.4.2`。触摸屏菜单和运行状态均使用英文。
+当前版本：`v0.4.3`。触摸屏菜单和运行状态均使用英文。
 
 本版本的主要行为：
 
 - `INNER`、`GLUE`和`NP`默认保存原生分辨率训练图片；
-- `Camera Results`页面可以随时开启或关闭训练图片保存；
+- `Camera Results`页面可以选择保存全部生产图片，关闭后进入95%复查图片保存模式；
 - `Auto Calibrate & Lock`只运行一次自动曝光和自动白平衡，然后保存并锁定参数；
 - `Capture and Save`手动按钮仍保存原生分辨率 JPG，并将像素逆时针旋转 90°；
 - `INNER`和`GLUE`使用各自的YOLO26s分类NCNN模型检测左右固定ROI；
 - 只有左右两侧都预测为`OK`且各自置信度不低于90%，整体结果才是`OK`；预测为`NG`时不设置最低置信度；
+- 未选择保存全部时，任何一侧为`NG`，或任何一侧为`OK`但置信度低于95%，仍会自动保存原图；
 - `Bypass AI (force all OK)`开启后仍然拍照并按保存选项处理图片，但跳过INNER/GLUE模型推理并显示强制OK；
 - 树莓派直接使用NCNN运行模型，不导入PyTorch或Ultralytics，避免系统BLAS兼容问题；
 - `Camera Results`保留并显示最近一次左右分类、置信度和AI处理时间；
@@ -32,15 +33,17 @@ X/Y/Z/U 调整数值，固定步长为 0.05，允许范围为 -0.50～+0.50。
 
 程序每次启动都会自动读取该文件；点击“取消”不会改变已保存的数据。
 
-`Camera Results`页面的`Save production images`选项用于控制生产触发
-图片是否保存。默认开启，修改后立即生效，并保存在：
+`Camera Results`页面的`Save all production images`选项用于选择保存模式。开启时保存
+所有生产触发图片；关闭时不保存高置信度正常图片，但任何一侧预测为`NG`，或者任何一侧
+预测为`OK`而置信度低于95%，仍然会保存用于复查和继续训练。修改后立即生效，并保存在：
 
 ```text
 ~/.config/tf_inner/capture_settings.json
 ```
 
 同一文件也保存`Bypass AI (force all OK)`开关。跳过检测默认关闭，修改后立即生效，
-并在程序重启后保持上次选择。保存选项不影响手动拍摄和故障照片保存。
+并在程序重启后保持上次选择。保存模式不影响手动拍摄和故障照片保存。开启跳过检测时
+没有真实AI置信度，因此只有勾选保存全部时才保存生产图片。
 
 程序启动后会在后台初始化 Picamera2，并读取摄像头的原生传感器分辨率持续运行
 （IMX477 通常为 4056×3040）。保存的 JPG 不缩小到 1080p，并在编码前将像素逆时针旋转
@@ -80,7 +83,7 @@ nano ~/.config/tf_inner/camera_settings.json
 减小`exposure_time_us`可以减少运动模糊但画面更暗；增大它会变亮但曝光时间更长。增大
 `analogue_gain`可以变亮，但会增加噪声。修改后保存并重启程序即可应用。不要把任何数值改成 0
 或负数。`Camera Results`页面中的`Capture and Save`按钮保存逆时针旋转 90° 的原生分辨率
-JPG；VT6 TCP 触发使用同一个相机服务，并根据页面上的训练图片保存选项决定是否写入文件。
+JPG；VT6 TCP 触发使用同一个相机服务，并根据页面上的保存模式以及AI结果决定是否写入文件。
 
 触发时使用 `capture_request(flush=True)`，确保被保存图片的曝光不会早于触发
 时刻。采集完成后再编码 JPG、保存并显示。图片保存在程序目录下：
@@ -103,8 +106,7 @@ NP\r\n
 CALIB\r\n
 ```
 
-当前版本收到`INNER`、`GLUE`或`NP`后，都会以原生分辨率完成一次新帧采集。训练图片保存
-默认开启，保存路径分别为：
+当前版本收到`INNER`、`GLUE`或`NP`后，都会以原生分辨率完成一次新帧采集。保存路径分别为：
 
 ```text
 captures/YYYYMMDD/INNER/YYYYMMDD_HHMMSS_mmm.jpg
@@ -112,8 +114,9 @@ captures/YYYYMMDD/GLUE/YYYYMMDD_HHMMSS_mmm.jpg
 captures/YYYYMMDD/NP/YYYYMMDD_HHMMSS_mmm.jpg
 ```
 
-保存的图片同样逆时针旋转 90°。关闭页面上的保存选项后仍会正常采集，但不编码或
-保存 JPG。无论是否保存，采集成功后都固定返回OK：
+树莓派上的完整位置是`~/tf-inner-gui/tf_gui/captures/`。保存的图片同样逆时针旋转90°。
+关闭`Save all production images`后，INNER/GLUE只保存任一NG或任一OK置信度低于95%的图片；
+NP没有AI结果，因此只在保存全部开启时保存。无论AI判断和是否保存，TCP都固定返回OK：
 
 ```text
 INNER,OK\r\n

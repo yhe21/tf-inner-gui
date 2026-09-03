@@ -11,7 +11,9 @@ sys.path.insert(0, str(PROJECT_DIR))
 from inspection import (  # noqa: E402
     FixedRoiClassifier,
     INSPECTION_CONFIG,
+    InspectionResult,
     SidePrediction,
+    requires_review_save,
 )
 
 
@@ -116,6 +118,34 @@ class InspectionTests(unittest.TestCase):
             ):
                 result = engine.inspect("INNER", object())
             self.assertEqual(result.overall_label, "NG")
+
+    def test_review_saving_uses_95_percent_ok_threshold(self) -> None:
+        high_confidence_ok = InspectionResult(
+            "INNER",
+            "OK",
+            SidePrediction("OK", 0.95),
+            SidePrediction("OK", 0.99),
+            10.0,
+        )
+        low_confidence_ok = InspectionResult(
+            "INNER",
+            "OK",
+            SidePrediction("OK", 0.9499),
+            SidePrediction("OK", 0.99),
+            10.0,
+        )
+        any_ng = InspectionResult(
+            "INNER",
+            "NG",
+            SidePrediction("NG", 0.51),
+            SidePrediction("OK", 0.99),
+            10.0,
+        )
+
+        self.assertFalse(requires_review_save(high_confidence_ok))
+        self.assertTrue(requires_review_save(low_confidence_ok))
+        self.assertTrue(requires_review_save(any_ng))
+        self.assertFalse(requires_review_save(InspectionResult.forced_ok("INNER")))
 
     def test_runtime_module_does_not_require_torch_or_ultralytics(self) -> None:
         source = (PROJECT_DIR / "inspection.py").read_text(encoding="utf-8")

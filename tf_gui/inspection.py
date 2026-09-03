@@ -13,6 +13,7 @@ DEFAULT_MODEL_ROOT = APP_DIR.parent / "models"
 PADDING_RGB = (114, 114, 114)
 CLASS_NAMES = ("NG", "OK")
 OK_CONFIDENCE_THRESHOLD = 0.90
+REVIEW_SAVE_OK_CONFIDENCE_THRESHOLD = 0.95
 
 # Coordinates are measured on the 3040x4056 image after the camera frame is
 # rotated 90 degrees counterclockwise.
@@ -63,6 +64,20 @@ class InspectionResult:
             elapsed_ms=0.0,
             was_bypassed=True,
         )
+
+
+def requires_review_save(
+    result: InspectionResult,
+    ok_confidence_threshold: float = REVIEW_SAVE_OK_CONFIDENCE_THRESHOLD,
+) -> bool:
+    """Return whether a real AI result should be retained for review/training."""
+    if result.was_bypassed:
+        return False
+    return any(
+        prediction.label != "OK"
+        or prediction.confidence < ok_confidence_threshold
+        for prediction in (result.left, result.right)
+    )
 
 
 class NcnnClassificationModel:

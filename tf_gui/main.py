@@ -16,8 +16,10 @@ from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets, uic
 from inspection import (
     DEFAULT_MODEL_ROOT,
     OK_CONFIDENCE_THRESHOLD,
+    REVIEW_SAVE_OK_CONFIDENCE_THRESHOLD,
     FixedRoiClassifier,
     InspectionResult,
+    requires_review_save,
 )
 
 
@@ -39,7 +41,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -330,6 +332,7 @@ class CaptureWorker(QtCore.QObject):
         bypass_inspection: bool = False,
     ) -> None:
         request = None
+        image_was_saved = False
         try:
             if save_image:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,18 +349,21 @@ class CaptureWorker(QtCore.QObject):
                 if bypass_inspection:
                     if save_image:
                         self.image_saver(request, output_path)
+                        image_was_saved = True
                     self.inspection_completed.emit(
                         InspectionResult.forced_ok(inspection_kind)
                     )
                 elif inspection_engine is None:
                     if save_image:
                         self.image_saver(request, output_path)
+                        image_was_saved = True
                     message = inspection_load_error or "AI models are not available"
                     self.inspection_failed.emit(inspection_kind, message)
                 else:
                     rotated_image = counterclockwise_rotated_image(request)
                     if save_image:
                         save_rotated_jpeg(rotated_image, output_path)
+                        image_was_saved = True
                     try:
                         result = inspection_engine.inspect(
                             inspection_kind, rotated_image
@@ -365,10 +371,15 @@ class CaptureWorker(QtCore.QObject):
                     except Exception as error:
                         self.inspection_failed.emit(inspection_kind, str(error))
                     else:
+                        if not image_was_saved and requires_review_save(result):
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            save_rotated_jpeg(rotated_image, output_path)
+                            image_was_saved = True
                         self.inspection_completed.emit(result)
             elif save_image:
                 self.image_saver(request, output_path)
-            self.succeeded.emit(str(output_path), save_image)
+                image_was_saved = True
+            self.succeeded.emit(str(output_path), image_was_saved)
         except Exception as error:
             self.failed.emit(str(error))
         finally:
@@ -1022,10 +1033,14 @@ class CameraMonitorDialog(QtWidgets.QDialog):
     @QtCore.pyqtSlot(bool)
     def production_save_toggled(self, enabled: bool) -> None:
         self.refresh_capture_mode()
-        state_text = "enabled" if enabled else "disabled"
-        self.lblCameraPageStatus.setText(
-            f"INNER/GLUE/NP training image saving {state_text}."
-        )
+        if enabled:
+            status_text = "All production image saving enabled."
+        else:
+            status_text = (
+                "Review-only saving enabled: any NG or OK confidence below "
+                f"{REVIEW_SAVE_OK_CONFIDENCE_THRESHOLD:.0%}."
+            )
+        self.lblCameraPageStatus.setText(status_text)
         self.production_save_changed.emit(enabled)
 
     @QtCore.pyqtSlot(bool)
@@ -1039,7 +1054,12 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.inspection_bypass_changed.emit(enabled)
 
     def refresh_capture_mode(self) -> None:
-        state_text = "ON" if self.chkSaveProductionImages.isChecked() else "OFF"
+        if self.chkSaveProductionImages.isChecked():
+            saving_text = "ALL"
+        else:
+            saving_text = (
+                f"REVIEW <{REVIEW_SAVE_OK_CONFIDENCE_THRESHOLD:.0%}"
+            )
         inspection_text = (
             "AI BYPASS" if self.chkBypassInspection.isChecked() else "AI ON"
         )
@@ -1052,7 +1072,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
                 f"Gain {float(settings['analogue_gain']):.2f}"
             )
         self.lblCaptureMode.setText(
-            f"Production saving {state_text} | {inspection_text} | {exposure_text}"
+            f"Saving {saving_text} | {inspection_text} | {exposure_text}"
         )
 
     def capture_is_running(self) -> bool:
@@ -1146,7 +1166,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
     def capture_succeeded(self, path_text: str, saved: bool) -> None:
         if not saved:
             self.lblCameraPageStatus.setText(
-                "Production frame captured successfully (not saved)."
+                "Production frame captured; no review image was required."
             )
             self.refresh_buttons()
             return

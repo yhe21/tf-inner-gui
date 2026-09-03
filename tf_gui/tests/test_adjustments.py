@@ -146,7 +146,7 @@ class AdjustmentTests(unittest.TestCase):
         dialog.chkBypassInspection.setChecked(True)
         self.assertEqual(choices, [True])
         self.assertEqual(bypass_choices, [True])
-        self.assertIn("saving ON", dialog.lblCaptureMode.text())
+        self.assertIn("Saving ALL", dialog.lblCaptureMode.text())
         self.assertIn("AI BYPASS", dialog.lblCaptureMode.text())
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -582,6 +582,67 @@ class AdjustmentTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].overall_label, "OK")
         self.assertTrue(results[0].was_bypassed)
+        self.assertTrue(camera.request.released)
+
+    def test_low_confidence_ok_is_saved_in_review_only_mode(self) -> None:
+        result = InspectionResult(
+            command="GLUE",
+            overall_label="OK",
+            left=SidePrediction("OK", 0.94),
+            right=SidePrediction("OK", 0.99),
+            elapsed_ms=10.0,
+        )
+
+        class FakeRequest:
+            def __init__(self):
+                self.released = False
+
+            def get_metadata(self):
+                return {"SensorTimestamp": 123}
+
+            def release(self):
+                self.released = True
+
+        class FakeCamera:
+            def __init__(self):
+                self.request = FakeRequest()
+
+            def capture_request(self, flush):
+                self.flush = flush
+                return self.request
+
+        class FakeInspectionEngine:
+            def inspect(self, _command, _image):
+                return result
+
+        camera = FakeCamera()
+        worker = CaptureWorker(warmup_seconds=0.0)
+        completed = []
+        worker.succeeded.connect(
+            lambda path_text, saved: completed.append((path_text, saved))
+        )
+        image_marker = object()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = (
+                Path(temporary_directory) / "captures" / "GLUE" / "review.jpg"
+            )
+            with mock.patch(
+                "main.counterclockwise_rotated_image",
+                return_value=image_marker,
+            ), mock.patch("main.save_rotated_jpeg") as save_image:
+                worker.capture_one(
+                    camera,
+                    output_path,
+                    save_image=False,
+                    inspection_kind="GLUE",
+                    inspection_engine=FakeInspectionEngine(),
+                )
+
+            save_image.assert_called_once_with(image_marker, output_path)
+            self.assertTrue(output_path.parent.exists())
+
+        self.assertEqual(completed, [(str(output_path), True)])
         self.assertTrue(camera.request.released)
 
     def test_vt6_commands_use_save_choice_and_return_results(self) -> None:

@@ -1,6 +1,6 @@
 # Raspberry Pi AI inspection test
 
-Version 0.4.2 adds fixed-ROI NCNN classification for `INNER` and `GLUE`.
+Version 0.4.3 adds fixed-ROI NCNN classification for `INNER` and `GLUE`.
 Inference calls NCNN directly and does not import PyTorch or Ultralytics.
 
 ## Required Raspberry Pi layout
@@ -62,9 +62,20 @@ classification always fails regardless of its confidence.
 capture and optional training-image saving. The bypass choice persists across
 application restarts and bypassed rows are explicitly marked on screen.
 
+When `Save all production images` is off, an INNER/GLUE full-resolution frame
+is still saved if either side is NG, or if either side is OK with confidence
+below 95%. Two OK predictions at or above 95% are not saved. Review images use
+the existing folders:
+
+```text
+~/tf-inner-gui/tf_gui/captures/YYYYMMDD/INNER/
+~/tf-inner-gui/tf_gui/captures/YYYYMMDD/GLUE/
+```
+
 During this commissioning version, all VT6 production replies are forced to
 `INNER,OK`, `GLUE,OK`, or `NP,OK`. A displayed NG result, a missing model, or a
 camera failure will not send NG to the Epson controller.
 
 The rotated full-resolution frame is cropped and classified in memory. Disk
-writing happens only when the existing training-image saving option is on.
+writing happens only for save-all mode or for a result selected by the 95%
+review rule.
