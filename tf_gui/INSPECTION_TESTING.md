@@ -1,6 +1,7 @@
 # Raspberry Pi AI inspection test
 
-Version 0.4.0 adds fixed-ROI NCNN classification for `INNER` and `GLUE`.
+Version 0.4.1 adds fixed-ROI NCNN classification for `INNER` and `GLUE`.
+Inference calls NCNN directly and does not import PyTorch or Ultralytics.
 
 ## Required Raspberry Pi layout
 
@@ -39,7 +40,7 @@ No separate model copy is required.
 ## Verify the Raspberry Pi runtime
 
 ```bash
-python3 -c "import ultralytics, ncnn, portalocker, tqdm; print('AI runtime OK')"
+python3 -c "import ncnn, numpy, PIL; print('AI runtime OK')"
 ls -l ~/tf-inner-gui/models/inner_cls_ncnn_model
 ls -l ~/tf-inner-gui/models/glue_cls_ncnn_model
 ```

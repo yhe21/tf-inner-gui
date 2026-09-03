@@ -1,16 +1,17 @@
-"""Fixed-ROI INNER and GLUE classification for Raspberry Pi inference."""
+"""Fixed-ROI INNER and GLUE classification using NCNN directly."""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_ROOT = APP_DIR.parent / "models"
 PADDING_RGB = (114, 114, 114)
+CLASS_NAMES = ("NG", "OK")
 
 # Coordinates are measured on the 3040x4056 image after the camera frame is
 # rotated 90 degrees counterclockwise.
@@ -50,6 +51,75 @@ class InspectionResult:
         return min(self.left.confidence, self.right.confidence)
 
 
+class NcnnClassificationModel:
+    """Run an exported Ultralytics classification model without PyTorch.
+
+    The NCNN export already contains the complete neural network, including
+    its final softmax. Direct loading avoids importing Ultralytics/PyTorch on
+    Raspberry Pi, where pip Torch wheels can conflict with the system BLAS.
+    """
+
+    def __init__(
+        self,
+        model_dir: Path,
+        class_names: Sequence[str] = CLASS_NAMES,
+        input_name: str = "in0",
+        output_name: str = "out0",
+        num_threads: int = 4,
+    ) -> None:
+        import ncnn
+
+        self.ncnn = ncnn
+        self.class_names = tuple(class_names)
+        self.input_name = input_name
+        self.output_name = output_name
+        self.net = ncnn.Net()
+        self.net.opt.num_threads = max(1, int(num_threads))
+        self.net.opt.use_vulkan_compute = False
+
+        parameter_file = Path(model_dir) / "model.ncnn.param"
+        weights_file = Path(model_dir) / "model.ncnn.bin"
+        for required_file in (parameter_file, weights_file):
+            if not required_file.is_file():
+                raise FileNotFoundError(f"NCNN model file not found: {required_file}")
+
+        if self.net.load_param(str(parameter_file)) != 0:
+            raise RuntimeError(f"Unable to load NCNN parameters: {parameter_file}")
+        if self.net.load_model(str(weights_file)) != 0:
+            raise RuntimeError(f"Unable to load NCNN weights: {weights_file}")
+
+    def predict(self, image: object) -> SidePrediction:
+        """Classify one RGB PIL image using training-time preprocessing."""
+        import numpy as np
+
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError(f"Expected an RGB image, got array shape {rgb.shape}")
+
+        # Ultralytics classification inference uses RGB CHW float32 / 255.
+        chw = np.ascontiguousarray(rgb.transpose(2, 0, 1) / 255.0)
+        input_mat = self.ncnn.Mat(chw).clone()
+        with self.net.create_extractor() as extractor:
+            input_status = extractor.input(self.input_name, input_mat)
+            if input_status != 0:
+                raise RuntimeError(f"NCNN input failed with status {input_status}")
+            output_status, output = extractor.extract(self.output_name)
+            if output_status != 0:
+                raise RuntimeError(f"NCNN inference failed with status {output_status}")
+
+        probabilities = np.asarray(output, dtype=np.float32).reshape(-1)
+        if len(probabilities) != len(self.class_names):
+            raise RuntimeError(
+                "NCNN returned "
+                f"{len(probabilities)} classes, expected {len(self.class_names)}"
+            )
+        top1 = int(probabilities.argmax())
+        return SidePrediction(
+            label=self.class_names[top1],
+            confidence=float(probabilities[top1]),
+        )
+
+
 def crop_and_pad(image: object, roi: Tuple[int, int, int, int], size: int) -> object:
     """Crop one fixed ROI and center it on the training-time gray square."""
     from PIL import Image
@@ -77,9 +147,7 @@ class FixedRoiClassifier:
     ) -> None:
         self.model_root = Path(model_root)
         if model_factory is None:
-            from ultralytics import YOLO
-
-            model_factory = lambda path: YOLO(str(path), task="classify")
+            model_factory = NcnnClassificationModel
 
         self.models: Dict[str, object] = {}
         for command, config in INSPECTION_CONFIG.items():
@@ -98,7 +166,7 @@ class FixedRoiClassifier:
         for command, model in self.models.items():
             size = int(INSPECTION_CONFIG[command]["imgsz"])
             dummy = Image.new("RGB", (size, size), PADDING_RGB)
-            model.predict(source=dummy, imgsz=size, verbose=False)
+            model.predict(dummy)
 
     def inspect(self, command: str, rotated_image: object) -> InspectionResult:
         command = command.upper()
@@ -112,27 +180,7 @@ class FixedRoiClassifier:
             crop_and_pad(rotated_image, config["left"], size),
             crop_and_pad(rotated_image, config["right"], size),
         ]
-        results = self.models[command].predict(
-            source=crops,
-            imgsz=size,
-            verbose=False,
-        )
-        if len(results) != 2:
-            raise RuntimeError(
-                f"{command} model returned {len(results)} results instead of 2"
-            )
-
-        predictions = []
-        for result in results:
-            if result.probs is None:
-                raise RuntimeError(f"{command} model returned no class probabilities")
-            top1 = int(result.probs.top1)
-            predictions.append(
-                SidePrediction(
-                    label=str(result.names[top1]).upper(),
-                    confidence=float(result.probs.top1conf),
-                )
-            )
+        predictions = [self.models[command].predict(crop) for crop in crops]
 
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         left, right = predictions

@@ -2,33 +2,28 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-from inspection import FixedRoiClassifier, INSPECTION_CONFIG  # noqa: E402
+from inspection import (  # noqa: E402
+    FixedRoiClassifier,
+    INSPECTION_CONFIG,
+    SidePrediction,
+)
 
 
 class FakeModel:
     def __init__(self, labels):
         self.labels = labels
-        self.sources = None
+        self.sources = []
 
-    def predict(self, source, **_options):
-        self.sources = source
-        results = []
-        for label, confidence in self.labels:
-            top1 = 1 if label == "OK" else 0
-            results.append(
-                SimpleNamespace(
-                    names={0: "NG", 1: "OK"},
-                    probs=SimpleNamespace(top1=top1, top1conf=confidence),
-                )
-            )
-        return results
+    def predict(self, source):
+        self.sources.append(source)
+        label, confidence = self.labels[len(self.sources) - 1]
+        return SidePrediction(label, confidence)
 
 
 class InspectionTests(unittest.TestCase):
@@ -62,6 +57,11 @@ class InspectionTests(unittest.TestCase):
             self.assertEqual(result.right.label, "NG")
             self.assertAlmostEqual(result.confidence, 0.91)
             self.assertEqual(models["inner_cls_ncnn_model"].sources, ["left", "right"])
+
+    def test_runtime_module_does_not_require_torch_or_ultralytics(self) -> None:
+        source = (PROJECT_DIR / "inspection.py").read_text(encoding="utf-8")
+        self.assertNotIn("import torch", source)
+        self.assertNotIn("import ultralytics", source)
 
     def test_missing_model_directory_fails_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
