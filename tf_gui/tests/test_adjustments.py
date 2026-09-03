@@ -102,6 +102,7 @@ class AdjustmentTests(unittest.TestCase):
         dialog = CameraMonitorDialog(controller)
         self.assertEqual(dialog.btnManualCapture.text(), "Capture and Save")
         self.assertTrue(dialog.chkSaveProductionImages.isChecked())
+        self.assertFalse(dialog.chkBypassInspection.isChecked())
         self.assertEqual(dialog.lblInnerResult.text(), "INNER: Not tested")
         self.assertEqual(dialog.lblGlueResult.text(), "GLUE: Not tested")
         self.assertFalse(dialog.capture_is_running())
@@ -125,23 +126,38 @@ class AdjustmentTests(unittest.TestCase):
         self.assertIn("AI 457 ms", dialog.lblInnerResult.text())
         self.assertEqual(dialog.lblInnerResult.property("inspectionState"), "NG")
 
+        controller.on_inspection_completed(InspectionResult.forced_ok("GLUE"))
+        self.assertEqual(
+            dialog.lblGlueResult.text(),
+            "GLUE: OK | INSPECTION BYPASSED",
+        )
+        self.assertEqual(dialog.lblGlueResult.property("inspectionState"), "OK")
+
     def test_production_save_choice_is_emitted_and_persisted(self) -> None:
         controller = CameraController()
         dialog = CameraMonitorDialog(
             controller, production_save_enabled=False
         )
         choices = []
+        bypass_choices = []
         dialog.production_save_changed.connect(choices.append)
+        dialog.inspection_bypass_changed.connect(bypass_choices.append)
         dialog.chkSaveProductionImages.setChecked(True)
+        dialog.chkBypassInspection.setChecked(True)
         self.assertEqual(choices, [True])
+        self.assertEqual(bypass_choices, [True])
         self.assertIn("saving ON", dialog.lblCaptureMode.text())
+        self.assertIn("AI BYPASS", dialog.lblCaptureMode.text())
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "capture_settings.json"
             store = CaptureSettingsStore(path)
             self.assertTrue(store.load())
+            self.assertFalse(store.load_bypass())
             store.save(False)
+            store.save_bypass(True)
             self.assertFalse(CaptureSettingsStore(path).load())
+            self.assertTrue(CaptureSettingsStore(path).load_bypass())
 
     def test_camera_settings_are_external_validated_and_persisted(self) -> None:
         settings = {
@@ -523,17 +539,69 @@ class AdjustmentTests(unittest.TestCase):
         self.assertEqual(results, [expected_result])
         self.assertTrue(camera.request.released)
 
+    def test_inspection_bypass_skips_ai_and_emits_forced_ok(self) -> None:
+        class FakeRequest:
+            def __init__(self):
+                self.released = False
+
+            def get_metadata(self):
+                return {"SensorTimestamp": 123}
+
+            def release(self):
+                self.released = True
+
+        class FakeCamera:
+            def __init__(self):
+                self.request = FakeRequest()
+
+            def capture_request(self, flush):
+                self.flush = flush
+                return self.request
+
+        class FailingInspectionEngine:
+            def inspect(self, _command, _image):
+                raise AssertionError("AI must not run while bypass is enabled")
+
+        camera = FakeCamera()
+        worker = CaptureWorker(warmup_seconds=0.0)
+        results = []
+        worker.inspection_completed.connect(results.append)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "not-saved.jpg"
+            worker.capture_one(
+                camera,
+                output_path,
+                save_image=False,
+                inspection_kind="INNER",
+                inspection_engine=FailingInspectionEngine(),
+                bypass_inspection=True,
+            )
+            self.assertFalse(output_path.exists())
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].overall_label, "OK")
+        self.assertTrue(results[0].was_bypassed)
+        self.assertTrue(camera.request.released)
+
     def test_vt6_commands_use_save_choice_and_return_results(self) -> None:
         controller = CameraController()
         controller.ready = True
         captured_jobs = []
 
         inspection_kinds = []
+        inspection_bypasses = []
 
-        def capture(output_path, save_image=True, inspection_kind=None):
+        def capture(
+            output_path,
+            save_image=True,
+            inspection_kind=None,
+            bypass_inspection=False,
+        ):
             controller.busy = True
             captured_jobs.append((output_path, save_image))
             inspection_kinds.append(inspection_kind)
+            inspection_bypasses.append(bypass_inspection)
             return True
 
         controller.capture = capture
@@ -543,6 +611,7 @@ class AdjustmentTests(unittest.TestCase):
             "DropNP": {"X": -0.10, "Y": 0.0, "Z": 0.0, "U": 0.10},
         }
         save_production_images = [True]
+        inspection_bypass = [False]
         server = Vt6TrainingServer(
             controller,
             lambda: calibration,
@@ -550,6 +619,7 @@ class AdjustmentTests(unittest.TestCase):
             save_production_images_provider=(
                 lambda: save_production_images[0]
             ),
+            inspection_bypass_provider=(lambda: inspection_bypass[0]),
         )
         self.assertTrue(server.start())
 
@@ -572,6 +642,7 @@ class AdjustmentTests(unittest.TestCase):
         self.assertEqual(captured_jobs[0][0].parent.name, "INNER")
         self.assertTrue(captured_jobs[0][1])
         self.assertEqual(inspection_kinds[0], "INNER")
+        self.assertFalse(inspection_bypasses[0])
 
         controller.on_capture_succeeded(str(captured_jobs[0][0]), True)
         self.assertEqual(self.read_response(client), "INNER,OK")
@@ -591,11 +662,13 @@ class AdjustmentTests(unittest.TestCase):
         self.assertEqual(self.read_response(client), "NP,OK")
 
         save_production_images[0] = False
+        inspection_bypass[0] = True
         client.write(b"INNER\r\n")
         client.flush()
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 4))
         self.assertFalse(captured_jobs[3][1])
         self.assertEqual(inspection_kinds[3], "INNER")
+        self.assertTrue(inspection_bypasses[3])
         client.disconnectFromHost()
         self.assertTrue(self.wait_until(lambda: server.current_client is None))
 
@@ -619,7 +692,12 @@ class AdjustmentTests(unittest.TestCase):
         controller.ready = True
         captured_jobs = []
 
-        def capture(output_path, save_image=True, inspection_kind=None):
+        def capture(
+            output_path,
+            save_image=True,
+            inspection_kind=None,
+            bypass_inspection=False,
+        ):
             controller.busy = True
             captured_jobs.append((output_path, save_image))
             return True
@@ -684,6 +762,7 @@ class AdjustmentTests(unittest.TestCase):
             Path("captures/inner.jpg"),
             None,
             9,
+            False,
             False,
         )
 

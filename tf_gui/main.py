@@ -13,7 +13,12 @@ from typing import Callable, Deque, Dict, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets, uic
 
-from inspection import DEFAULT_MODEL_ROOT, FixedRoiClassifier, InspectionResult
+from inspection import (
+    DEFAULT_MODEL_ROOT,
+    OK_CONFIDENCE_THRESHOLD,
+    FixedRoiClassifier,
+    InspectionResult,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -34,7 +39,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -46,11 +51,11 @@ DEFAULT_ADJUSTMENTS = {
     station: {axis: 0.0 for axis in AXES} for station in STATIONS
 }
 
-CaptureCommand = Tuple[str, Optional[Path], bool, Optional[str]]
+CaptureCommand = Tuple[str, Optional[Path], bool, Optional[str], bool]
 ImageSaver = Callable[[object, Path], None]
 # response_session identifies the TCP connection that issued a capture request.
 # A result from an old connection must never be delivered to a new connection.
-CaptureJob = Tuple[Optional[str], Path, Optional[str], Optional[int], bool]
+CaptureJob = Tuple[Optional[str], Path, Optional[str], Optional[int], bool, bool]
 
 
 def build_capture_path(
@@ -167,13 +172,22 @@ class CaptureWorker(QtCore.QObject):
         output_path: Path,
         save_image: bool = True,
         inspection_kind: Optional[str] = None,
+        bypass_inspection: bool = False,
     ) -> None:
         """Thread-safe: enqueue a capture without touching the camera object."""
-        self.commands.put(("capture", output_path, save_image, inspection_kind))
+        self.commands.put(
+            (
+                "capture",
+                output_path,
+                save_image,
+                inspection_kind,
+                bypass_inspection,
+            )
+        )
 
     def request_auto_calibration(self) -> None:
         """Thread-safe: run AE/AWB once, then lock the measured controls."""
-        self.commands.put(("auto_calibrate", None, False, None))
+        self.commands.put(("auto_calibrate", None, False, None, False))
 
     def stop(self) -> None:
         """Thread-safe: finish the current capture, then close the camera."""
@@ -212,7 +226,9 @@ class CaptureWorker(QtCore.QObject):
                     )
                 else:
                     self.inspection_status_changed.emit(
-                        "INNER and GLUE AI models ready", True
+                        "INNER/GLUE AI ready - "
+                        f"OK threshold {OK_CONFIDENCE_THRESHOLD:.0%}",
+                        True,
                     )
 
             self.ready.emit(
@@ -223,7 +239,13 @@ class CaptureWorker(QtCore.QObject):
                 command = self.commands.get()
                 if command is None:
                     break
-                command_name, output_path, save_image, inspection_kind = command
+                (
+                    command_name,
+                    output_path,
+                    save_image,
+                    inspection_kind,
+                    bypass_inspection,
+                ) = command
                 if command_name == "auto_calibrate":
                     self.auto_calibrate(camera)
                     continue
@@ -238,6 +260,7 @@ class CaptureWorker(QtCore.QObject):
                     inspection_kind,
                     inspection_engine,
                     inspection_load_error,
+                    bypass_inspection,
                 )
         except Exception as error:  # Picamera2 raises several backend exceptions.
             self.initialization_failed.emit(str(error))
@@ -304,6 +327,7 @@ class CaptureWorker(QtCore.QObject):
         inspection_kind: Optional[str] = None,
         inspection_engine: Optional[object] = None,
         inspection_load_error: Optional[str] = None,
+        bypass_inspection: bool = False,
     ) -> None:
         request = None
         try:
@@ -319,7 +343,13 @@ class CaptureWorker(QtCore.QObject):
             )
 
             if inspection_kind in {"INNER", "GLUE"}:
-                if inspection_engine is None:
+                if bypass_inspection:
+                    if save_image:
+                        self.image_saver(request, output_path)
+                    self.inspection_completed.emit(
+                        InspectionResult.forced_ok(inspection_kind)
+                    )
+                elif inspection_engine is None:
                     if save_image:
                         self.image_saver(request, output_path)
                     message = inspection_load_error or "AI models are not available"
@@ -434,11 +464,17 @@ class CameraController(QtCore.QObject):
         output_path: Path,
         save_image: bool = True,
         inspection_kind: Optional[str] = None,
+        bypass_inspection: bool = False,
     ) -> bool:
         if not self.ready or self.busy or self.worker is None:
             return False
         self.busy = True
-        self.worker.request_capture(output_path, save_image, inspection_kind)
+        self.worker.request_capture(
+            output_path,
+            save_image,
+            inspection_kind,
+            bypass_inspection,
+        )
         return True
 
     def auto_calibrate(self) -> bool:
@@ -559,6 +595,7 @@ class Vt6TrainingServer(QtCore.QObject):
         port: int = DEFAULT_TCP_PORT,
         error_root: Path = ERROR_RECORD_ROOT,
         save_production_images_provider: Optional[Callable[[], bool]] = None,
+        inspection_bypass_provider: Optional[Callable[[], bool]] = None,
         parent: Optional[QtCore.QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -568,6 +605,9 @@ class Vt6TrainingServer(QtCore.QObject):
         self.error_root = error_root
         self.save_production_images_provider = (
             save_production_images_provider or (lambda: True)
+        )
+        self.inspection_bypass_provider = (
+            inspection_bypass_provider or (lambda: False)
         )
         self.server = QtNetwork.QTcpServer(self)
         self.current_client: Optional[QtNetwork.QTcpSocket] = None
@@ -700,6 +740,7 @@ class Vt6TrainingServer(QtCore.QObject):
                 None,
                 response_session,
                 bool(self.save_production_images_provider()),
+                bool(self.inspection_bypass_provider()),
             )
         )
         self.start_next_capture()
@@ -718,7 +759,7 @@ class Vt6TrainingServer(QtCore.QObject):
         # Fault images have priority over queued production captures. An active
         # exposure is allowed to finish before this capture starts.
         self.capture_queue.appendleft(
-            (None, output_path, error_code, None, True)
+            (None, output_path, error_code, None, True, False)
         )
         self.start_next_capture()
 
@@ -755,6 +796,7 @@ class Vt6TrainingServer(QtCore.QObject):
             job[1],
             save_image=job[4],
             inspection_kind=inspection_kind,
+            bypass_inspection=job[5],
         ):
             self.active_capture = job
         else:
@@ -774,6 +816,7 @@ class Vt6TrainingServer(QtCore.QObject):
                 _error_code,
                 response_session,
                 _save_image,
+                _bypass_inspection,
             ) = self.active_capture
             self.active_capture = None
 
@@ -792,6 +835,7 @@ class Vt6TrainingServer(QtCore.QObject):
                 error_code,
                 response_session,
                 _save_image,
+                _bypass_inspection,
             ) = self.active_capture
             self.active_capture = None
             if response_command is not None:
@@ -839,12 +883,14 @@ class CameraMonitorDialog(QtWidgets.QDialog):
     """Camera page backed by the application-wide production camera service."""
 
     production_save_changed = QtCore.pyqtSignal(bool)
+    inspection_bypass_changed = QtCore.pyqtSignal(bool)
 
     def __init__(
         self,
         camera_controller: CameraController,
         parent: Optional[QtWidgets.QWidget] = None,
         production_save_enabled: bool = True,
+        inspection_bypass_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         uic.loadUi(str(CAMERA_MONITOR_UI_FILE), self)
@@ -852,11 +898,15 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.last_capture_path: Optional[Path] = None
 
         self.chkSaveProductionImages.setChecked(production_save_enabled)
+        self.chkBypassInspection.setChecked(inspection_bypass_enabled)
         self.btnManualCapture.clicked.connect(self.start_capture)
         self.btnAutoExposure.clicked.connect(self.start_auto_calibration)
         self.btnCameraBack.clicked.connect(self.reject)
         self.chkSaveProductionImages.toggled.connect(
             self.production_save_toggled
+        )
+        self.chkBypassInspection.toggled.connect(
+            self.inspection_bypass_toggled
         )
 
         self.camera_controller.status_changed.connect(self.camera_status_changed)
@@ -882,9 +932,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         )
 
         self.lblCameraPageStatus.setText(self.camera_controller.status_text)
-        self.lblInspectionStatus.setText(
-            self.camera_controller.inspection_status_text
-        )
+        self.refresh_inspection_status()
         self.refresh_inspection_results()
         self.refresh_capture_mode()
         self.refresh_buttons()
@@ -903,6 +951,8 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
     @staticmethod
     def result_label_text(result: InspectionResult) -> str:
+        if result.was_bypassed:
+            return f"{result.command}: OK | INSPECTION BYPASSED"
         return (
             f"{result.command}: {result.overall_label} | "
             f"L {result.left.label} {result.left.confidence * 100:.1f}% | "
@@ -942,8 +992,22 @@ class CameraMonitorDialog(QtWidgets.QDialog):
     def inspection_status_changed(
         self, status_text: str, is_ready: bool
     ) -> None:
+        self.refresh_inspection_status(status_text, is_ready)
+
+    def refresh_inspection_status(
+        self,
+        status_text: Optional[str] = None,
+        is_ready: Optional[bool] = None,
+    ) -> None:
+        if self.chkBypassInspection.isChecked():
+            status_text = "Inspection bypass ON - all results forced OK"
+            is_ready = True
+        else:
+            status_text = status_text or self.camera_controller.inspection_status_text
+            if is_ready is None:
+                is_ready = self.camera_controller.inspection_ready
         self.lblInspectionStatus.setText(status_text)
-        self.lblInspectionStatus.setProperty("statusOk", is_ready)
+        self.lblInspectionStatus.setProperty("statusOk", bool(is_ready))
         self.lblInspectionStatus.style().unpolish(self.lblInspectionStatus)
         self.lblInspectionStatus.style().polish(self.lblInspectionStatus)
 
@@ -964,8 +1028,21 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         )
         self.production_save_changed.emit(enabled)
 
+    @QtCore.pyqtSlot(bool)
+    def inspection_bypass_toggled(self, enabled: bool) -> None:
+        self.refresh_capture_mode()
+        self.refresh_inspection_status()
+        state_text = "enabled" if enabled else "disabled"
+        self.lblCameraPageStatus.setText(
+            f"Inspection bypass {state_text}."
+        )
+        self.inspection_bypass_changed.emit(enabled)
+
     def refresh_capture_mode(self) -> None:
         state_text = "ON" if self.chkSaveProductionImages.isChecked() else "OFF"
+        inspection_text = (
+            "AI BYPASS" if self.chkBypassInspection.isChecked() else "AI ON"
+        )
         settings = self.camera_controller.camera_settings
         if settings is None:
             exposure_text = "Calibration required"
@@ -975,7 +1052,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
                 f"Gain {float(settings['analogue_gain']):.2f}"
             )
         self.lblCaptureMode.setText(
-            f"Production saving {state_text} | {exposure_text}"
+            f"Production saving {state_text} | {inspection_text} | {exposure_text}"
         )
 
     def capture_is_running(self) -> bool:
@@ -1101,6 +1178,9 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         )
         self.btnCameraBack.setEnabled(not self.camera_controller.busy)
         self.chkSaveProductionImages.setEnabled(
+            not self.camera_controller.busy
+        )
+        self.chkBypassInspection.setEnabled(
             not self.camera_controller.busy
         )
 
@@ -1241,33 +1321,53 @@ class AdjustmentStore:
 
 
 class CaptureSettingsStore:
-    """Persist whether VT6 production captures are saved for training."""
+    """Persist production image saving and AI bypass choices."""
 
     def __init__(self, path: Path = CAPTURE_SETTINGS_FILE) -> None:
         self.path = path
 
     def load(self) -> bool:
+        return self.load_settings()["save_training_images"]
+
+    def load_bypass(self) -> bool:
+        return self.load_settings()["bypass_inspection"]
+
+    def load_settings(self) -> Dict[str, bool]:
+        defaults = {
+            "save_training_images": True,
+            "bypass_inspection": False,
+        }
         if not self.path.exists():
-            self.save(True)
-            return True
+            self._write(defaults)
+            return defaults
 
         try:
             saved_data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return True
+            return defaults
 
-        saved_value = saved_data.get("save_training_images", True)
-        return saved_value if isinstance(saved_value, bool) else True
+        if not isinstance(saved_data, dict):
+            return defaults
+        return {
+            key: saved_data.get(key) if isinstance(saved_data.get(key), bool) else value
+            for key, value in defaults.items()
+        }
 
     def save(self, enabled: bool) -> None:
+        settings = self.load_settings()
+        settings["save_training_images"] = bool(enabled)
+        self._write(settings)
+
+    def save_bypass(self, enabled: bool) -> None:
+        settings = self.load_settings()
+        settings["bypass_inspection"] = bool(enabled)
+        self._write(settings)
+
+    def _write(self, settings: Dict[str, bool]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_file = self.path.with_suffix(".tmp")
         temporary_file.write_text(
-            json.dumps(
-                {"save_training_images": bool(enabled)},
-                ensure_ascii=False,
-                indent=2,
-            )
+            json.dumps(settings, ensure_ascii=False, indent=2)
             + "\n",
             encoding="utf-8",
         )
@@ -1431,8 +1531,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             self.save_training_images = self.capture_settings_store.load()
+            self.inspection_bypass = self.capture_settings_store.load_bypass()
         except OSError as error:
             self.save_training_images = True
+            self.inspection_bypass = False
             QtWidgets.QMessageBox.warning(
                 self,
                 "Capture Settings Error",
@@ -1477,6 +1579,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 save_production_images_provider=(
                     lambda: self.save_training_images
                 ),
+                inspection_bypass_provider=(
+                    lambda: self.inspection_bypass
+                ),
                 parent=self,
             )
             self.vt6_server.status_changed.connect(self.update_vt6_status)
@@ -1515,9 +1620,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.camera_controller,
             self,
             production_save_enabled=self.save_training_images,
+            inspection_bypass_enabled=self.inspection_bypass,
         )
         dialog.production_save_changed.connect(
             self.set_production_image_saving
+        )
+        dialog.inspection_bypass_changed.connect(
+            self.set_inspection_bypass
         )
         if self.isFullScreen():
             dialog.setWindowState(dialog.windowState() | QtCore.Qt.WindowFullScreen)
@@ -1536,6 +1645,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
                 "Capture Settings Error",
                 "The setting is active for this session but could not be "
+                f"saved:\n{error}",
+            )
+
+    @QtCore.pyqtSlot(bool)
+    def set_inspection_bypass(self, enabled: bool) -> None:
+        self.inspection_bypass = enabled
+        try:
+            self.capture_settings_store.save_bypass(enabled)
+        except OSError as error:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Capture Settings Error",
+                "The bypass setting is active for this session but could not be "
                 f"saved:\n{error}",
             )
 

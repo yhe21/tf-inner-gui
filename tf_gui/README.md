@@ -1,6 +1,6 @@
 # TF Inner GUI
 
-当前版本：`v0.4.1`。触摸屏菜单和运行状态均使用英文。
+当前版本：`v0.4.2`。触摸屏菜单和运行状态均使用英文。
 
 本版本的主要行为：
 
@@ -9,6 +9,8 @@
 - `Auto Calibrate & Lock`只运行一次自动曝光和自动白平衡，然后保存并锁定参数；
 - `Capture and Save`手动按钮仍保存原生分辨率 JPG，并将像素逆时针旋转 90°；
 - `INNER`和`GLUE`使用各自的YOLO26s分类NCNN模型检测左右固定ROI；
+- 只有左右两侧都预测为`OK`且各自置信度不低于90%，整体结果才是`OK`；预测为`NG`时不设置最低置信度；
+- `Bypass AI (force all OK)`开启后仍然拍照并按保存选项处理图片，但跳过INNER/GLUE模型推理并显示强制OK；
 - 树莓派直接使用NCNN运行模型，不导入PyTorch或Ultralytics，避免系统BLAS兼容问题；
 - `Camera Results`保留并显示最近一次左右分类、置信度和AI处理时间；
 - 机器人故障代码仍保存统一日志和故障照片；
@@ -30,14 +32,15 @@ X/Y/Z/U 调整数值，固定步长为 0.05，允许范围为 -0.50～+0.50。
 
 程序每次启动都会自动读取该文件；点击“取消”不会改变已保存的数据。
 
-`Camera Results`页面的`Save INNER/GLUE/NP images for training`选项用于控制生产触发
+`Camera Results`页面的`Save production images`选项用于控制生产触发
 图片是否保存。默认开启，修改后立即生效，并保存在：
 
 ```text
 ~/.config/tf_inner/capture_settings.json
 ```
 
-因此程序重启后仍会使用上次选择。这个选项不影响手动拍摄和故障照片保存。
+同一文件也保存`Bypass AI (force all OK)`开关。跳过检测默认关闭，修改后立即生效，
+并在程序重启后保持上次选择。保存选项不影响手动拍摄和故障照片保存。
 
 程序启动后会在后台初始化 Picamera2，并读取摄像头的原生传感器分辨率持续运行
 （IMX477 通常为 4056×3040）。保存的 JPG 不缩小到 1080p，并在编码前将像素逆时针旋转

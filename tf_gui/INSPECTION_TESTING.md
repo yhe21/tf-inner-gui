@@ -1,6 +1,6 @@
 # Raspberry Pi AI inspection test
 
-Version 0.4.1 adds fixed-ROI NCNN classification for `INNER` and `GLUE`.
+Version 0.4.2 adds fixed-ROI NCNN classification for `INNER` and `GLUE`.
 Inference calls NCNN directly and does not import PyTorch or Ultralytics.
 
 ## Required Raspberry Pi layout
@@ -55,7 +55,12 @@ python3 main.py --fullscreen
 The Camera Results page retains the latest `INNER` and `GLUE` results. Each
 row shows the strict two-sided result, left/right class confidence, and total
 AI processing time. A displayed overall result is `OK` only when both sides
-are classified `OK`.
+are classified `OK` with confidence greater than or equal to 90%. An `NG`
+classification always fails regardless of its confidence.
+
+`Bypass AI (force all OK)` skips INNER/GLUE inference while continuing camera
+capture and optional training-image saving. The bypass choice persists across
+application restarts and bypassed rows are explicitly marked on screen.
 
 During this commissioning version, all VT6 production replies are forced to
 `INNER,OK`, `GLUE,OK`, or `NP,OK`. A displayed NG result, a missing model, or a

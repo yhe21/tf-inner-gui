@@ -58,6 +58,65 @@ class InspectionTests(unittest.TestCase):
             self.assertAlmostEqual(result.confidence, 0.91)
             self.assertEqual(models["inner_cls_ncnn_model"].sources, ["left", "right"])
 
+    def test_ok_requires_90_percent_confidence_on_both_sides(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for config in INSPECTION_CONFIG.values():
+                (root / config["model_dir"]).mkdir()
+
+            inner_model = FakeModel([("OK", 0.90), ("OK", 0.99)])
+            models = {
+                "inner_cls_ncnn_model": inner_model,
+                "glue_cls_ncnn_model": FakeModel([]),
+            }
+            engine = FixedRoiClassifier(
+                root,
+                model_factory=lambda path: models[path.name],
+                warmup=False,
+            )
+            with mock.patch(
+                "inspection.crop_and_pad", side_effect=["left", "right"]
+            ):
+                passing = engine.inspect("INNER", object())
+            self.assertEqual(passing.overall_label, "OK")
+
+            models["inner_cls_ncnn_model"] = FakeModel(
+                [("OK", 0.8999), ("OK", 0.99)]
+            )
+            engine = FixedRoiClassifier(
+                root,
+                model_factory=lambda path: models[path.name],
+                warmup=False,
+            )
+            with mock.patch(
+                "inspection.crop_and_pad", side_effect=["left", "right"]
+            ):
+                failing = engine.inspect("INNER", object())
+            self.assertEqual(failing.overall_label, "NG")
+
+    def test_ng_always_fails_without_a_confidence_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for config in INSPECTION_CONFIG.values():
+                (root / config["model_dir"]).mkdir()
+
+            models = {
+                "inner_cls_ncnn_model": FakeModel(
+                    [("NG", 0.01), ("OK", 0.99)]
+                ),
+                "glue_cls_ncnn_model": FakeModel([]),
+            }
+            engine = FixedRoiClassifier(
+                root,
+                model_factory=lambda path: models[path.name],
+                warmup=False,
+            )
+            with mock.patch(
+                "inspection.crop_and_pad", side_effect=["left", "right"]
+            ):
+                result = engine.inspect("INNER", object())
+            self.assertEqual(result.overall_label, "NG")
+
     def test_runtime_module_does_not_require_torch_or_ultralytics(self) -> None:
         source = (PROJECT_DIR / "inspection.py").read_text(encoding="utf-8")
         self.assertNotIn("import torch", source)

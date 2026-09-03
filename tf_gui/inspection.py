@@ -12,6 +12,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_ROOT = APP_DIR.parent / "models"
 PADDING_RGB = (114, 114, 114)
 CLASS_NAMES = ("NG", "OK")
+OK_CONFIDENCE_THRESHOLD = 0.90
 
 # Coordinates are measured on the 3040x4056 image after the camera frame is
 # rotated 90 degrees counterclockwise.
@@ -44,11 +45,24 @@ class InspectionResult:
     left: SidePrediction
     right: SidePrediction
     elapsed_ms: float
+    was_bypassed: bool = False
 
     @property
     def confidence(self) -> float:
         """Return the conservative confidence shown for the overall result."""
         return min(self.left.confidence, self.right.confidence)
+
+    @classmethod
+    def forced_ok(cls, command: str) -> "InspectionResult":
+        """Build an explicit OK result when inspection bypass is enabled."""
+        return cls(
+            command=command.upper(),
+            overall_label="OK",
+            left=SidePrediction("OK", 1.0),
+            right=SidePrediction("OK", 1.0),
+            elapsed_ms=0.0,
+            was_bypassed=True,
+        )
 
 
 class NcnnClassificationModel:
@@ -144,8 +158,12 @@ class FixedRoiClassifier:
         model_root: Path = DEFAULT_MODEL_ROOT,
         model_factory: Optional[Callable[[Path], object]] = None,
         warmup: bool = True,
+        ok_confidence_threshold: float = OK_CONFIDENCE_THRESHOLD,
     ) -> None:
         self.model_root = Path(model_root)
+        self.ok_confidence_threshold = float(ok_confidence_threshold)
+        if not 0.0 <= self.ok_confidence_threshold <= 1.0:
+            raise ValueError("OK confidence threshold must be between 0 and 1")
         if model_factory is None:
             model_factory = NcnnClassificationModel
 
@@ -184,7 +202,15 @@ class FixedRoiClassifier:
 
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         left, right = predictions
-        overall_label = "OK" if left.label == "OK" and right.label == "OK" else "NG"
+        overall_label = (
+            "OK"
+            if all(
+                prediction.label == "OK"
+                and prediction.confidence >= self.ok_confidence_threshold
+                for prediction in predictions
+            )
+            else "NG"
+        )
         return InspectionResult(
             command=command,
             overall_label=overall_label,
