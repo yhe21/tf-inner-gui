@@ -212,6 +212,49 @@ QFrame#cameraImageFrame {
     border-radius: 14px;
 }
 
+QFrame#inspectionResultsFrame {
+    background-color: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+}
+
+QLabel#lblInspectionStatus {
+    color: #475569;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+QLabel#lblInspectionStatus[statusOk="true"] {
+    color: #166534;
+}
+
+QLabel#lblInnerResult,
+QLabel#lblGlueResult {
+    padding: 5px 8px;
+    color: #475569;
+    background-color: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    font-size: 16px;
+    font-weight: 700;
+}
+
+QLabel#lblInnerResult[inspectionState="OK"],
+QLabel#lblGlueResult[inspectionState="OK"] {
+    color: #166534;
+    background-color: #dcfce7;
+    border-color: #86efac;
+}
+
+QLabel#lblInnerResult[inspectionState="NG"],
+QLabel#lblGlueResult[inspectionState="NG"],
+QLabel#lblInnerResult[inspectionState="ERROR"],
+QLabel#lblGlueResult[inspectionState="ERROR"] {
+    color: #991b1b;
+    background-color: #fee2e2;
+    border-color: #fca5a5;
+}
+
 QLabel#lblCapturedImage {
     color: #cbd5e1;
     background-color: #0f172a;

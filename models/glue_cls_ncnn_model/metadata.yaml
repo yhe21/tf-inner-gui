@@ -1,0 +1,21 @@
+description: Ultralytics YOLO26s-cls model trained on C:\Users\y\Downloads\YOLO\datasets\glue
+author: Ultralytics
+date: '2026-09-03T12:28:40.117323-04:00'
+version: 8.4.138
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 1
+task: classify
+head: Classify
+batch: 1
+imgsz:
+- 224
+- 224
+names:
+  0: NG
+  1: OK
+args:
+  batch: 1
+  quantize: null
+channels: 3
+end2end: false

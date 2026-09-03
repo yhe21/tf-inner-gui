@@ -1,6 +1,6 @@
 # TF Inner GUI
 
-当前版本：`v0.3.0`。触摸屏菜单和运行状态均使用英文。
+当前版本：`v0.4.0`。触摸屏菜单和运行状态均使用英文。
 
 本版本的主要行为：
 
@@ -8,6 +8,8 @@
 - `Camera Results`页面可以随时开启或关闭训练图片保存；
 - `Auto Calibrate & Lock`只运行一次自动曝光和自动白平衡，然后保存并锁定参数；
 - `Capture and Save`手动按钮仍保存原生分辨率 JPG，并将像素逆时针旋转 90°；
+- `INNER`和`GLUE`使用各自的YOLO26s分类NCNN模型检测左右固定ROI；
+- `Camera Results`保留并显示最近一次左右分类、置信度和AI处理时间；
 - 机器人故障代码仍保存统一日志和故障照片；
 - TCP结果仅发送给原请求连接，不向重连后的新连接补发旧结果。
 
@@ -115,10 +117,10 @@ GLUE,OK\r\n
 NP,OK\r\n
 ```
 
-只有摄像头未就绪、队列已满或采集失败时才会返回`INNER,NG`、`GLUE,NG`或`NP,NG`。
+当前为调试运行阶段：即使页面显示模型判断为NG、模型加载失败、摄像头未就绪、队列已满
+或拍摄失败，TCP也仍然只返回`INNER,OK`、`GLUE,OK`或`NP,OK`，不会输出NG。
 手动拍摄仍保存在`captures/YYYYMMDD/`。机器人故障字符串仍写入统一日志并在
-`error_records/`中保存逆时针旋转 90° 的故障照片。正式检测阶段将运行对应YOLO模型，NG保存
-图片，OK不保存图片。
+`error_records/`中保存逆时针旋转 90° 的故障照片。
 
 `CALIB`不拍照，直接返回12个逗号分隔的数值，固定顺序为：
 
@@ -160,16 +162,24 @@ python .\main.py
 
 开发阶段直接加载 `.ui`，不需要运行 `pyuic5`，所以每次保存后重新启动程序即可看到修改。
 
-## 复制到 Raspberry Pi
+## 更新到 Raspberry Pi
 
-从该目录的上一级执行。将下面的 IPv6 地址替换为树莓派实际地址：
+程序和两个 NCNN 模型都保存在同一个 GitHub 仓库中。树莓派只需执行：
 
-```powershell
-scp -6 -r .\tf_gui "y@[fe80::树莓派地址%网卡编号]:~/tf-inner-gui/"
+```bash
+cd ~/tf-inner-gui
+git pull
 ```
 
-也可以通过 VS Code Remote SSH 把整个`tf_gui`文件夹上传到
-`~/tf-inner-gui/`。
+`git pull` 会同时更新程序、界面以及以下两个运行模型，不再需要使用
+`scp` 单独复制模型：
+
+```text
+models/inner_cls_ncnn_model/
+models/glue_cls_ncnn_model/
+```
+
+训练数据、训练记录和 `.pt` 文件仍然只保留在训练电脑上，不会下载到树莓派。
 
 ## 在 Raspberry Pi 上测试
 

@@ -16,6 +16,8 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from PyQt5 import QtNetwork, QtWidgets  # noqa: E402
 
+from inspection import InspectionResult, SidePrediction  # noqa: E402
+
 from main import (  # noqa: E402
     AdjustmentDialog,
     AdjustmentStore,
@@ -100,7 +102,28 @@ class AdjustmentTests(unittest.TestCase):
         dialog = CameraMonitorDialog(controller)
         self.assertEqual(dialog.btnManualCapture.text(), "Capture and Save")
         self.assertTrue(dialog.chkSaveProductionImages.isChecked())
+        self.assertEqual(dialog.lblInnerResult.text(), "INNER: Not tested")
+        self.assertEqual(dialog.lblGlueResult.text(), "GLUE: Not tested")
         self.assertFalse(dialog.capture_is_running())
+
+    def test_camera_page_shows_latest_inspection_result(self) -> None:
+        controller = CameraController()
+        dialog = CameraMonitorDialog(controller)
+        result = InspectionResult(
+            command="INNER",
+            overall_label="NG",
+            left=SidePrediction("OK", 0.9876),
+            right=SidePrediction("NG", 0.9123),
+            elapsed_ms=456.7,
+        )
+
+        controller.on_inspection_completed(result)
+
+        self.assertIn("INNER: NG", dialog.lblInnerResult.text())
+        self.assertIn("L OK 98.8%", dialog.lblInnerResult.text())
+        self.assertIn("R NG 91.2%", dialog.lblInnerResult.text())
+        self.assertIn("AI 457 ms", dialog.lblInnerResult.text())
+        self.assertEqual(dialog.lblInnerResult.property("inspectionState"), "NG")
 
     def test_production_save_choice_is_emitted_and_persisted(self) -> None:
         controller = CameraController()
@@ -439,14 +462,78 @@ class AdjustmentTests(unittest.TestCase):
             ],
         )
 
+    def test_production_inspection_uses_memory_image_without_disk_write(self) -> None:
+        image_marker = object()
+        expected_result = InspectionResult(
+            command="INNER",
+            overall_label="OK",
+            left=SidePrediction("OK", 0.99),
+            right=SidePrediction("OK", 0.98),
+            elapsed_ms=10.0,
+        )
+
+        class FakeRequest:
+            def __init__(self):
+                self.released = False
+
+            def get_metadata(self):
+                return {"SensorTimestamp": 123}
+
+            def release(self):
+                self.released = True
+
+        class FakeCamera:
+            def __init__(self):
+                self.request = FakeRequest()
+
+            def capture_request(self, flush):
+                self.flush = flush
+                return self.request
+
+        class FakeInspectionEngine:
+            def __init__(self):
+                self.calls = []
+
+            def inspect(self, command, image):
+                self.calls.append((command, image))
+                return expected_result
+
+        camera = FakeCamera()
+        engine = FakeInspectionEngine()
+        worker = CaptureWorker(warmup_seconds=0.0)
+        results = []
+        worker.inspection_completed.connect(results.append)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "not-saved.jpg"
+            with mock.patch(
+                "main.counterclockwise_rotated_image",
+                return_value=image_marker,
+            ):
+                worker.capture_one(
+                    camera,
+                    output_path,
+                    save_image=False,
+                    inspection_kind="INNER",
+                    inspection_engine=engine,
+                )
+            self.assertFalse(output_path.exists())
+
+        self.assertEqual(engine.calls, [("INNER", image_marker)])
+        self.assertEqual(results, [expected_result])
+        self.assertTrue(camera.request.released)
+
     def test_vt6_commands_use_save_choice_and_return_results(self) -> None:
         controller = CameraController()
         controller.ready = True
         captured_jobs = []
 
-        def capture(output_path, save_image=True):
+        inspection_kinds = []
+
+        def capture(output_path, save_image=True, inspection_kind=None):
             controller.busy = True
             captured_jobs.append((output_path, save_image))
+            inspection_kinds.append(inspection_kind)
             return True
 
         controller.capture = capture
@@ -484,18 +571,21 @@ class AdjustmentTests(unittest.TestCase):
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 1))
         self.assertEqual(captured_jobs[0][0].parent.name, "INNER")
         self.assertTrue(captured_jobs[0][1])
+        self.assertEqual(inspection_kinds[0], "INNER")
 
         controller.on_capture_succeeded(str(captured_jobs[0][0]), True)
         self.assertEqual(self.read_response(client), "INNER,OK")
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 2))
         self.assertEqual(captured_jobs[1][0].parent.name, "GLUE")
         self.assertTrue(captured_jobs[1][1])
+        self.assertEqual(inspection_kinds[1], "GLUE")
 
         controller.on_capture_succeeded(str(captured_jobs[1][0]), True)
         self.assertEqual(self.read_response(client), "GLUE,OK")
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 3))
         self.assertEqual(captured_jobs[2][0].parent.name, "NP")
         self.assertTrue(captured_jobs[2][1])
+        self.assertIsNone(inspection_kinds[2])
 
         controller.on_capture_succeeded(str(captured_jobs[2][0]), True)
         self.assertEqual(self.read_response(client), "NP,OK")
@@ -505,6 +595,7 @@ class AdjustmentTests(unittest.TestCase):
         client.flush()
         self.assertTrue(self.wait_until(lambda: len(captured_jobs) == 4))
         self.assertFalse(captured_jobs[3][1])
+        self.assertEqual(inspection_kinds[3], "INNER")
         client.disconnectFromHost()
         self.assertTrue(self.wait_until(lambda: server.current_client is None))
 
@@ -528,7 +619,7 @@ class AdjustmentTests(unittest.TestCase):
         controller.ready = True
         captured_jobs = []
 
-        def capture(output_path, save_image=True):
+        def capture(output_path, save_image=True, inspection_kind=None):
             controller.busy = True
             captured_jobs.append((output_path, save_image))
             return True
@@ -560,6 +651,45 @@ class AdjustmentTests(unittest.TestCase):
             self.assertIn(captured_path.name, log_text)
 
             controller.on_capture_succeeded(str(captured_path), True)
+
+    def test_production_commands_force_ok_when_camera_is_unavailable(self) -> None:
+        controller = CameraController()
+        controller.ready = False
+        server = Vt6TrainingServer(controller, lambda: {}, port=0)
+        responses = []
+        server.send_response = (
+            lambda response, response_session=None: responses.append(
+                (response, response_session)
+            )
+            or True
+        )
+
+        server.handle_command("INNER", response_session=7)
+        server.handle_command("GLUE", response_session=7)
+
+        self.assertEqual(responses, [("INNER,OK", 7), ("GLUE,OK", 7)])
+
+    def test_production_capture_failure_also_forces_ok(self) -> None:
+        controller = CameraController()
+        server = Vt6TrainingServer(controller, lambda: {}, port=0)
+        responses = []
+        server.send_response = (
+            lambda response, response_session=None: responses.append(
+                (response, response_session)
+            )
+            or True
+        )
+        server.active_capture = (
+            "INNER",
+            Path("captures/inner.jpg"),
+            None,
+            9,
+            False,
+        )
+
+        server.capture_failed("simulated camera failure")
+
+        self.assertEqual(responses, [("INNER,OK", 9)])
 
     @classmethod
     def wait_until(cls, condition, timeout_seconds=1.0):

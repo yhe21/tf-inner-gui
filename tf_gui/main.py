@@ -13,6 +13,8 @@ from typing import Callable, Deque, Dict, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets, uic
 
+from inspection import DEFAULT_MODEL_ROOT, FixedRoiClassifier, InspectionResult
+
 
 APP_DIR = Path(__file__).resolve().parent
 UI_FILE = APP_DIR / "ui" / "main_menu.ui"
@@ -32,7 +34,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -44,7 +46,7 @@ DEFAULT_ADJUSTMENTS = {
     station: {axis: 0.0 for axis in AXES} for station in STATIONS
 }
 
-CaptureCommand = Tuple[str, Optional[Path], bool]
+CaptureCommand = Tuple[str, Optional[Path], bool, Optional[str]]
 ImageSaver = Callable[[object, Path], None]
 # response_session identifies the TCP connection that issued a capture request.
 # A result from an old connection must never be delivered to a new connection.
@@ -106,10 +108,20 @@ def save_counterclockwise_rotated_jpeg(
     request: object, output_path: Path
 ) -> None:
     """Rotate captured pixels 90 degrees counterclockwise and encode JPEG."""
+    rotated_image = counterclockwise_rotated_image(request)
+    save_rotated_jpeg(rotated_image, output_path)
+
+
+def counterclockwise_rotated_image(request: object) -> object:
+    """Detach a full-resolution PIL image from a camera request and rotate it."""
     from PIL import Image
 
     image = request.make_image("main")
-    rotated_image = image.transpose(Image.Transpose.ROTATE_90)
+    return image.transpose(Image.Transpose.ROTATE_90)
+
+
+def save_rotated_jpeg(rotated_image: object, output_path: Path) -> None:
+    """Encode an already rotated full-resolution PIL image as JPEG."""
     rotated_image.save(output_path, format="JPEG", quality=95)
 
 
@@ -123,6 +135,9 @@ class CaptureWorker(QtCore.QObject):
     auto_calibration_failed = QtCore.pyqtSignal(str)
     capture_started = QtCore.pyqtSignal(str, bool)
     frame_acquired = QtCore.pyqtSignal(str, int, bool)
+    inspection_status_changed = QtCore.pyqtSignal(str, bool)
+    inspection_completed = QtCore.pyqtSignal(object)
+    inspection_failed = QtCore.pyqtSignal(str, str)
     succeeded = QtCore.pyqtSignal(str, bool)
     failed = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
@@ -135,6 +150,7 @@ class CaptureWorker(QtCore.QObject):
         initial_camera_settings: Optional[Dict[str, object]] = None,
         auto_calibration_seconds: float = 2.0,
         manual_settle_seconds: float = 0.5,
+        inspection_engine_factory: Optional[Callable[[], object]] = None,
     ) -> None:
         super().__init__()
         self.camera_factory = camera_factory
@@ -143,15 +159,21 @@ class CaptureWorker(QtCore.QObject):
         self.camera_settings = deepcopy(initial_camera_settings)
         self.auto_calibration_seconds = auto_calibration_seconds
         self.manual_settle_seconds = manual_settle_seconds
+        self.inspection_engine_factory = inspection_engine_factory
         self.commands: "queue.Queue[Optional[CaptureCommand]]" = queue.Queue()
 
-    def request_capture(self, output_path: Path, save_image: bool = True) -> None:
+    def request_capture(
+        self,
+        output_path: Path,
+        save_image: bool = True,
+        inspection_kind: Optional[str] = None,
+    ) -> None:
         """Thread-safe: enqueue a capture without touching the camera object."""
-        self.commands.put(("capture", output_path, save_image))
+        self.commands.put(("capture", output_path, save_image, inspection_kind))
 
     def request_auto_calibration(self) -> None:
         """Thread-safe: run AE/AWB once, then lock the measured controls."""
-        self.commands.put(("auto_calibrate", None, False))
+        self.commands.put(("auto_calibrate", None, False, None))
 
     def stop(self) -> None:
         """Thread-safe: finish the current capture, then close the camera."""
@@ -160,6 +182,8 @@ class CaptureWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self) -> None:
         camera = None
+        inspection_engine = None
+        inspection_load_error: Optional[str] = None
         try:
             camera = self.camera_factory()
             native_resolution = tuple(camera.sensor_resolution)
@@ -176,6 +200,21 @@ class CaptureWorker(QtCore.QObject):
             # A saved manual configuration is active before the first frame.
             # Without one, AE/AWB may run only so the operator can calibrate.
             time.sleep(self.warmup_seconds)
+
+            if self.inspection_engine_factory is not None:
+                self.inspection_status_changed.emit("AI models loading...", False)
+                try:
+                    inspection_engine = self.inspection_engine_factory()
+                except Exception as error:
+                    inspection_load_error = str(error)
+                    self.inspection_status_changed.emit(
+                        f"AI model error: {inspection_load_error}", False
+                    )
+                else:
+                    self.inspection_status_changed.emit(
+                        "INNER and GLUE AI models ready", True
+                    )
+
             self.ready.emit(
                 *native_resolution, self.camera_settings is not None
             )
@@ -184,7 +223,7 @@ class CaptureWorker(QtCore.QObject):
                 command = self.commands.get()
                 if command is None:
                     break
-                command_name, output_path, save_image = command
+                command_name, output_path, save_image, inspection_kind = command
                 if command_name == "auto_calibrate":
                     self.auto_calibrate(camera)
                     continue
@@ -192,7 +231,14 @@ class CaptureWorker(QtCore.QObject):
                     self.failed.emit("Capture path is missing")
                     continue
                 self.capture_started.emit(str(output_path), save_image)
-                self.capture_one(camera, output_path, save_image)
+                self.capture_one(
+                    camera,
+                    output_path,
+                    save_image,
+                    inspection_kind,
+                    inspection_engine,
+                    inspection_load_error,
+                )
         except Exception as error:  # Picamera2 raises several backend exceptions.
             self.initialization_failed.emit(str(error))
         finally:
@@ -251,7 +297,13 @@ class CaptureWorker(QtCore.QObject):
                     request.release()
 
     def capture_one(
-        self, camera: object, output_path: Path, save_image: bool
+        self,
+        camera: object,
+        output_path: Path,
+        save_image: bool,
+        inspection_kind: Optional[str] = None,
+        inspection_engine: Optional[object] = None,
+        inspection_load_error: Optional[str] = None,
     ) -> None:
         request = None
         try:
@@ -265,7 +317,26 @@ class CaptureWorker(QtCore.QObject):
             self.frame_acquired.emit(
                 str(output_path), sensor_timestamp, save_image
             )
-            if save_image:
+
+            if inspection_kind in {"INNER", "GLUE"}:
+                if inspection_engine is None:
+                    if save_image:
+                        self.image_saver(request, output_path)
+                    message = inspection_load_error or "AI models are not available"
+                    self.inspection_failed.emit(inspection_kind, message)
+                else:
+                    rotated_image = counterclockwise_rotated_image(request)
+                    if save_image:
+                        save_rotated_jpeg(rotated_image, output_path)
+                    try:
+                        result = inspection_engine.inspect(
+                            inspection_kind, rotated_image
+                        )
+                    except Exception as error:
+                        self.inspection_failed.emit(inspection_kind, str(error))
+                    else:
+                        self.inspection_completed.emit(result)
+            elif save_image:
                 self.image_saver(request, output_path)
             self.succeeded.emit(str(output_path), save_image)
         except Exception as error:
@@ -284,6 +355,9 @@ class CameraController(QtCore.QObject):
     frame_acquired = QtCore.pyqtSignal(str, int, bool)
     capture_succeeded = QtCore.pyqtSignal(str, bool)
     capture_failed = QtCore.pyqtSignal(str)
+    inspection_status_changed = QtCore.pyqtSignal(str, bool)
+    inspection_completed = QtCore.pyqtSignal(object)
+    inspection_failed = QtCore.pyqtSignal(str, str)
     auto_calibration_started = QtCore.pyqtSignal()
     auto_calibration_succeeded = QtCore.pyqtSignal(object)
     auto_calibration_failed = QtCore.pyqtSignal(str)
@@ -294,12 +368,14 @@ class CameraController(QtCore.QObject):
         parent: Optional[QtCore.QObject] = None,
         worker_factory: Optional[Callable[[], CaptureWorker]] = None,
         initial_camera_settings: Optional[Dict[str, object]] = None,
+        inspection_engine_factory: Optional[Callable[[], object]] = None,
     ) -> None:
         super().__init__(parent)
         self.camera_settings = deepcopy(initial_camera_settings)
         self.worker_factory = worker_factory or (
             lambda: CaptureWorker(
-                initial_camera_settings=deepcopy(self.camera_settings)
+                initial_camera_settings=deepcopy(self.camera_settings),
+                inspection_engine_factory=inspection_engine_factory,
             )
         )
         self.thread: Optional[QtCore.QThread] = None
@@ -308,6 +384,10 @@ class CameraController(QtCore.QObject):
         self.ready = False
         self.busy = False
         self.status_text = "Camera starting..."
+        self.inspection_status_text = "AI models not loaded"
+        self.inspection_ready = False
+        self.latest_inspection_results: Dict[str, InspectionResult] = {}
+        self.latest_inspection_errors: Dict[str, str] = {}
 
     def start(self) -> None:
         if self.thread is not None and self.thread.isRunning():
@@ -335,6 +415,11 @@ class CameraController(QtCore.QObject):
         )
         self.worker.capture_started.connect(self.capture_started)
         self.worker.frame_acquired.connect(self.frame_acquired)
+        self.worker.inspection_status_changed.connect(
+            self.on_inspection_status_changed
+        )
+        self.worker.inspection_completed.connect(self.on_inspection_completed)
+        self.worker.inspection_failed.connect(self.on_inspection_failed)
         self.worker.succeeded.connect(self.on_capture_succeeded)
         self.worker.failed.connect(self.on_capture_failed)
         self.worker.stopped.connect(
@@ -344,11 +429,16 @@ class CameraController(QtCore.QObject):
         self.thread.finished.connect(self.on_thread_finished)
         self.thread.start()
 
-    def capture(self, output_path: Path, save_image: bool = True) -> bool:
+    def capture(
+        self,
+        output_path: Path,
+        save_image: bool = True,
+        inspection_kind: Optional[str] = None,
+    ) -> bool:
         if not self.ready or self.busy or self.worker is None:
             return False
         self.busy = True
-        self.worker.request_capture(output_path, save_image)
+        self.worker.request_capture(output_path, save_image, inspection_kind)
         return True
 
     def auto_calibrate(self) -> bool:
@@ -430,11 +520,31 @@ class CameraController(QtCore.QObject):
         self.busy = False
         self.capture_failed.emit(error_message)
 
+    @QtCore.pyqtSlot(str, bool)
+    def on_inspection_status_changed(
+        self, status_text: str, is_ready: bool
+    ) -> None:
+        self.inspection_status_text = status_text
+        self.inspection_ready = is_ready
+        self.inspection_status_changed.emit(status_text, is_ready)
+
+    @QtCore.pyqtSlot(object)
+    def on_inspection_completed(self, result: InspectionResult) -> None:
+        self.latest_inspection_results[result.command] = result
+        self.latest_inspection_errors.pop(result.command, None)
+        self.inspection_completed.emit(result)
+
+    @QtCore.pyqtSlot(str, str)
+    def on_inspection_failed(self, command: str, error_message: str) -> None:
+        self.latest_inspection_errors[command] = error_message
+        self.inspection_failed.emit(command, error_message)
+
     @QtCore.pyqtSlot()
     def on_thread_finished(self) -> None:
         self.camera_available = False
         self.ready = False
         self.busy = False
+        self.inspection_ready = False
 
 
 class Vt6TrainingServer(QtCore.QObject):
@@ -575,10 +685,12 @@ class Vt6TrainingServer(QtCore.QObject):
         self, command: str, response_session: Optional[int] = None
     ) -> None:
         if not self.camera_controller.ready:
-            self.send_response(f"{command},NG", response_session)
+            # Training/commissioning mode: never stop the robot from an RPi
+            # camera or model condition. The UI still reports the problem.
+            self.send_response(f"{command},OK", response_session)
             return
         if len(self.capture_queue) >= MAX_CAPTURE_QUEUE:
-            self.send_response(f"{command},NG", response_session)
+            self.send_response(f"{command},OK", response_session)
             return
 
         self.capture_queue.append(
@@ -638,7 +750,12 @@ class Vt6TrainingServer(QtCore.QObject):
             return
 
         job = self.capture_queue.popleft()
-        if self.camera_controller.capture(job[1], save_image=job[4]):
+        inspection_kind = job[0] if job[0] in {"INNER", "GLUE"} else None
+        if self.camera_controller.capture(
+            job[1],
+            save_image=job[4],
+            inspection_kind=inspection_kind,
+        ):
             self.active_capture = job
         else:
             self.capture_queue.appendleft(job)
@@ -679,7 +796,7 @@ class Vt6TrainingServer(QtCore.QObject):
             self.active_capture = None
             if response_command is not None:
                 self.send_response(
-                    f"{response_command},NG", response_session
+                    f"{response_command},OK", response_session
                 )
             elif error_code is not None:
                 self.append_error_log(
@@ -747,6 +864,13 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         self.camera_controller.frame_acquired.connect(self.frame_acquired)
         self.camera_controller.capture_succeeded.connect(self.capture_succeeded)
         self.camera_controller.capture_failed.connect(self.capture_failed)
+        self.camera_controller.inspection_status_changed.connect(
+            self.inspection_status_changed
+        )
+        self.camera_controller.inspection_completed.connect(
+            self.inspection_completed
+        )
+        self.camera_controller.inspection_failed.connect(self.inspection_failed)
         self.camera_controller.auto_calibration_started.connect(
             self.auto_calibration_started
         )
@@ -758,8 +882,78 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         )
 
         self.lblCameraPageStatus.setText(self.camera_controller.status_text)
+        self.lblInspectionStatus.setText(
+            self.camera_controller.inspection_status_text
+        )
+        self.refresh_inspection_results()
         self.refresh_capture_mode()
         self.refresh_buttons()
+
+    def refresh_inspection_results(self) -> None:
+        for command in ("INNER", "GLUE"):
+            if command in self.camera_controller.latest_inspection_errors:
+                self.show_inspection_error(
+                    command,
+                    self.camera_controller.latest_inspection_errors[command],
+                )
+            elif command in self.camera_controller.latest_inspection_results:
+                self.show_inspection_result(
+                    self.camera_controller.latest_inspection_results[command]
+                )
+
+    @staticmethod
+    def result_label_text(result: InspectionResult) -> str:
+        return (
+            f"{result.command}: {result.overall_label} | "
+            f"L {result.left.label} {result.left.confidence * 100:.1f}% | "
+            f"R {result.right.label} {result.right.confidence * 100:.1f}% | "
+            f"AI {result.elapsed_ms:.0f} ms"
+        )
+
+    def result_label(self, command: str) -> QtWidgets.QLabel:
+        return self.lblInnerResult if command == "INNER" else self.lblGlueResult
+
+    def set_result_state(
+        self, label: QtWidgets.QLabel, state: str, text: str
+    ) -> None:
+        label.setText(text)
+        label.setProperty("inspectionState", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def show_inspection_result(self, result: InspectionResult) -> None:
+        self.set_result_state(
+            self.result_label(result.command),
+            result.overall_label,
+            self.result_label_text(result),
+        )
+
+    def show_inspection_error(self, command: str, error_message: str) -> None:
+        concise_error = error_message.replace("\r", " ").replace("\n", " ")
+        if len(concise_error) > 80:
+            concise_error = concise_error[:77] + "..."
+        self.set_result_state(
+            self.result_label(command),
+            "ERROR",
+            f"{command}: AI ERROR | {concise_error}",
+        )
+
+    @QtCore.pyqtSlot(str, bool)
+    def inspection_status_changed(
+        self, status_text: str, is_ready: bool
+    ) -> None:
+        self.lblInspectionStatus.setText(status_text)
+        self.lblInspectionStatus.setProperty("statusOk", is_ready)
+        self.lblInspectionStatus.style().unpolish(self.lblInspectionStatus)
+        self.lblInspectionStatus.style().polish(self.lblInspectionStatus)
+
+    @QtCore.pyqtSlot(object)
+    def inspection_completed(self, result: InspectionResult) -> None:
+        self.show_inspection_result(result)
+
+    @QtCore.pyqtSlot(str, str)
+    def inspection_failed(self, command: str, error_message: str) -> None:
+        self.show_inspection_error(command, error_message)
 
     @QtCore.pyqtSlot(bool)
     def production_save_toggled(self, enabled: bool) -> None:
@@ -935,6 +1129,18 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             (self.camera_controller.frame_acquired, self.frame_acquired),
             (self.camera_controller.capture_succeeded, self.capture_succeeded),
             (self.camera_controller.capture_failed, self.capture_failed),
+            (
+                self.camera_controller.inspection_status_changed,
+                self.inspection_status_changed,
+            ),
+            (
+                self.camera_controller.inspection_completed,
+                self.inspection_completed,
+            ),
+            (
+                self.camera_controller.inspection_failed,
+                self.inspection_failed,
+            ),
             (
                 self.camera_controller.auto_calibration_started,
                 self.auto_calibration_started,
@@ -1196,6 +1402,7 @@ class MainWindow(QtWidgets.QMainWindow):
         camera_settings_store: Optional[CameraSettingsStore] = None,
         tcp_port: int = DEFAULT_TCP_PORT,
         tcp_enabled: bool = True,
+        model_root: Path = DEFAULT_MODEL_ROOT,
     ) -> None:
         super().__init__()
         uic.loadUi(str(UI_FILE), self)
@@ -1251,6 +1458,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.camera_controller = CameraController(
             self,
             initial_camera_settings=self.camera_settings,
+            inspection_engine_factory=(
+                lambda: FixedRoiClassifier(model_root=model_root)
+            ),
         )
         self.camera_controller.status_changed.connect(self.update_camera_status)
         self.camera_controller.camera_settings_changed.connect(
@@ -1417,6 +1627,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the VT6 TCP server for UI-only testing.",
     )
+    parser.add_argument(
+        "--model-root",
+        type=Path,
+        default=DEFAULT_MODEL_ROOT,
+        help=f"Folder containing the NCNN model directories (default: {DEFAULT_MODEL_ROOT}).",
+    )
     return parser.parse_args()
 
 
@@ -1428,6 +1644,7 @@ def main() -> int:
     window = MainWindow(
         tcp_port=args.tcp_port,
         tcp_enabled=not args.no_tcp,
+        model_root=args.model_root,
     )
     if args.fullscreen:
         window.showFullScreen()

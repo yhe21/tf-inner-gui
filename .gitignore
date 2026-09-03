@@ -3,6 +3,7 @@
 venv/
 __pycache__/
 *.py[cod]
+.ultralytics/
 
 # IDE and operating-system files
 .vscode/
@@ -10,11 +11,24 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Runtime models, captures, and detection outputs
+# Runtime captures and training outputs
 *.pt
-*_ncnn_model/
 captures/
 error_records/
 runs/
 data/
-models/
+
+# Deploy these two NCNN models with the application so Raspberry Pi updates
+# need only `git pull`. Other local model exports remain ignored.
+models/*
+!models/inner_cls_ncnn_model/
+!models/inner_cls_ncnn_model/**
+!models/glue_cls_ncnn_model/
+!models/glue_cls_ncnn_model/**
+models/**/__pycache__/
+
+# Local classification images are intentionally not committed to Git.
+# Keep only the empty directory structure used by the training tools.
+datasets/**
+!datasets/**/
+!datasets/**/.gitkeep
