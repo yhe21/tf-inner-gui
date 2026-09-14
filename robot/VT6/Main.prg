@@ -1,5 +1,9 @@
 #define X_offset -0.2
 #define Y_offset -0.1
+' Plate-layer debounce settings. Reserve timer 5 for IsLayerChanged only.
+#define LAYER_STABLE_SECONDS 0.5
+#define LAYER_SAMPLE_SECONDS 0.01
+#define LAYER_DEBOUNCE_TIMER 5
 Real Distance
 Global Preserve Integer Count, NP_Loc, Layer
 Global Preserve Boolean isLastFilled, isBufferLoaded
@@ -103,21 +107,18 @@ NetReconnect:
 			Case "INNER,OK"
 				Print "INNER OK"
 			Case "INNER,NG"
+				MemOn RpiNgStopReq
 				Print #202, "NO_INNER"
-				Wait 0.05
-				Quit All
 			Case "GLUE,OK"
 				Print "GLUE OK"
 			Case "GLUE,NG"
+				MemOn RpiNgStopReq
 				Print #202, "NO_GLUE"
-				Wait 0.05
-				Quit All
 			Case "NP,OK"
 				Print "NP OK"
 			Case "NP,NG"
+				MemOn RpiNgStopReq
 				Print #202, "NO_NP"
-				Wait 0.05
-				Quit All
 			Default
 				' Apply every CALIB value that arrived. Missing values keep
 				' their current value, which is zero after initialization.
@@ -227,6 +228,8 @@ Function Init
 	MemOff RpiGlueReq
 	MemOff RpiNpReq
 	MemOff RpiCalibReq
+	' Reset the latched camera NG only when starting the main program.
+	MemOff RpiNgStopReq
 	RpiConnected = False
 	RpiFatalPending = False
 	RpiFatalSent = 0
@@ -265,7 +268,7 @@ Function Init
 		Pass Here :Z(550) LJM
 		Go P_Pick_Part1 LJM
 	EndIf
-		UpdateLayer
+		Call UpdateLayer(ReadPlateLayer)
 	On finishedDropNP; Wait 0.15; On finishedPickPart; On finishedPutPart
 	Wait Sw(dropNPReq) = On And Sw(pickPartReq) = On And Sw(putPartReq) = On
 	Wait 0.5
@@ -282,7 +285,7 @@ Function Init_Reset
 	NP_Loc = 1
 	isLastFilled = False
 	isBufferLoaded = False
-	UpdateLayer
+	Call UpdateLayer(ReadPlateLayer)
 	Off finishedDropNP
 	Off finishedPickPart
 	Off finishedPutPart
@@ -299,7 +302,7 @@ Function Init_Reset
 		Off secondPlaceReq
 	EndIf
 	Wait 1
-	UpdateLayer
+	Call UpdateLayer(ReadPlateLayer)
 	Wait Sw(okPosition) = On
 	
 	'Init
@@ -319,6 +322,13 @@ Function Pick_Part
 	
 	'Move P_pick_Part1 CP
 	Move P_Pick_Part +Z(125) +X(33.5) CP
+	' Deferred camera NG stop: the normal path has no added Wait or motion.
+	If MemSw(RpiNgStopReq) = On Then
+		Wait 0.5
+		Move P_Pick_Part1
+		Wait 1
+		Quit All
+	EndIf
 	If MemSw(IsPickOk) = False Then
 		If firstLoc = True Then
 			Wait MemSw(IsPickOk) = True, 150
@@ -333,9 +343,8 @@ Function Pick_Part
 		EndIf
 	EndIf
 	
-	Move P_Pick_Part
-	On vacuumSol1
-	On vacuumSol2
+	Move P_Pick_Part ! D50; On vacuumSol1; On vacuumSol2; !
+
 	Wait 0.25
 
 	Move P_Pick_Part +Z(125) +X(33.5) CP
@@ -430,11 +439,11 @@ Fend
 Function Pick_NP
 	If (NP_Loc = 1) Then
 		Go P_Pick_NP +X(NPX) +Y(NPY) +Z(6 + NPZ) +U(NPU) LJM
-		Go P_Pick_NP +X(NPX) +Y(NPY) +Z(NPZ) +U(NPU) LJM ! D30; On vacuumSol1; On vacuumSol2 !
+		Go P_Pick_NP +X(NPX) +Y(NPY) +Z(NPZ) +U(NPU) LJM ! D70; On vacuumSol1; On vacuumSol2 !
 		NP_Loc = 2
 	ElseIf (NP_Loc = 2) Then
 		Go P_Pick_NPS +X(NPSX) +Y(NPSY) +Z(6 + NPSZ) +U(NPSU) LJM
-		Go P_Pick_NPS +X(NPSX) +Y(NPSY) +Z(NPSZ) +U(NPSU) LJM ! D30; On vacuumSol1; On vacuumSol2 !
+		Go P_Pick_NPS +X(NPSX) +Y(NPSY) +Z(NPSZ) +U(NPSU) LJM ! D70; On vacuumSol1; On vacuumSol2 !
         NP_Loc = 1
 	Else
 		FatalError "NP_LOCATION_INVALID"
@@ -478,11 +487,11 @@ Function Drop_NP
 	MemOn RpiGlueReq
 	
 	Power_Mid
-	Move P_Drop_NP +X(3 + DROPX) +Y(-0.5 + DROPY) +Z(10 + DROPZ) +U(DROPU) +W(-5) CP
-	Move P_Drop_NP +X(2 + DROPX) +Y(-0.5 + DROPY) +Z(3.5 + DROPZ) +U(DROPU) +W(-5); '
-	Move P_Drop_NP +X(4.2 + DROPX) +Y(0.8 + DROPY) +Z(2.5 + DROPZ) +U(DROPU) +W(-5); '
-	Move P_Drop_NP +X(2.2 + DROPX + 1) +Y(0.8 + DROPY) +Z(0.3 + DROPZ) +U(0.15 + DROPU) ROT ! D50; Off vacuumSol1; Off vacuumSol2; !
-	Move P_Drop_NP +X(3 + DROPX) +Y(DROPY) +Z(0 + DROPZ) +U(0.15 + DROPU)
+	Move P_Drop_NP +X(3 + DROPX) +Y(+0.3 + DROPY) +Z(10 + DROPZ) +U(DROPU) +W(-5) CP
+	Move P_Drop_NP +X(2 + DROPX) +Y(+0.3 + DROPY) +Z(3.5 + DROPZ) +U(DROPU) +W(-5); '
+	Move P_Drop_NP +X(4.2 + DROPX) +Y(-0.3 + DROPY) +Z(2.5 + DROPZ) +U(DROPU) +W(-5); '
+	Move P_Drop_NP +X(2.2 + DROPX + 1) +Y(-0.3 + DROPY) +Z(0.3 + DROPZ) +U(0 + DROPU) ROT ! D50; Off vacuumSol1; Off vacuumSol2; !
+	Move P_Drop_NP +X(3 + DROPX) +Y(DROPY) +Z(0 + DROPZ) +U(0 + DROPU)
 	'Move P_Drop_NP +Z(3) CP
 	Move P_Drop_NP +W(0) +Z(25) ! D50; On finishedDropNP !
 	Power_High
@@ -497,7 +506,7 @@ Function Pick_Fixture
 		EndIf
 	EndIf
 	' The assembled NP is visible and stationary. Trigger before pickup motion.
-	MemOn RpiNpReq
+	MemOn RPiNpReq
 
 	Off finishedDropNP
 	Move P_Drop_NP +X(DROPX) +Y(DROPY) +Z(3 + DROPZ) +U(DROPU)
@@ -654,14 +663,16 @@ Function Drop_Pallet
 	
 Fend
 Function Search_pallet
+	Integer confirmedLayer
 
 	'Pass T_PF_E_1 LJM
 	'Pass T_PF_E_2 LJM
 	
 	'Pass P_Mid LJM
 	MemOff IsPalletOk
-	Do While IsLayerChanged
-		UpdateLayer
+	Do While IsLayerChanged(ByRef confirmedLayer)
+		' Echo and apply the same stable snapshot; do not read the inputs again.
+		Call UpdateLayer(confirmedLayer)
 		Count = 1
 	Loop
 	If (Sw(ejecting) = On) Then
@@ -672,7 +683,7 @@ Function Search_pallet
 		Count = 1
 		isLastFilled = False
 		Wait 0.25
-		UpdateLayer
+		Call UpdateLayer(ReadPlateLayer)
 	EndIf
 	If Sw(okPosition) = Off Then
 		Wait Sw(okPosition) = On, 15
@@ -767,59 +778,70 @@ Function Search_pallet
 	EndIf
 	MemOn IsPalletOk
 Fend
-'true when layer does not match
-Function IsLayerChanged As Boolean
-	Integer B0, B1, B2, NLayer
-	Print "Old Layer:", Layer
+Function ReadPlateLayer As Integer
+	Integer NLayer
+	NLayer = 0
 	If (Sw(plateBit0) = On) Then
-		B0 = 1
-	Else
-		B0 = 0
+		NLayer = NLayer + 1
 	EndIf
 	If (Sw(plateBit1) = On) Then
-		B1 = 2
-	Else
-		B1 = 0
+		NLayer = NLayer + 2
 	EndIf
 	If (Sw(plateBit2) = On) Then
-		B2 = 4
-	Else
-		B2 = 0
+		NLayer = NLayer + 4
 	EndIf
-	NLayer = B0 + B1 + B2
-	If (NLayer = Layer) Then
-		IsLayerChanged = False
-	Else
-		IsLayerChanged = True
-		Print "Layer changed. New Layer:", NLayer
+	ReadPlateLayer = NLayer
+Fend
+
+' True only after one different layer code stays stable for 0.5 seconds.
+Function IsLayerChanged(ByRef confirmedLayer As Integer) As Boolean
+	Integer candidateLayer, sampledLayer
+	IsLayerChanged = False
+	confirmedLayer = Layer
+	candidateLayer = ReadPlateLayer
+	' Normal cycles do not incur the debounce delay.
+	If candidateLayer = Layer Then
+		Exit Function
 	EndIf
+	TmReset LAYER_DEBOUNCE_TIMER
+	Do
+		Wait LAYER_SAMPLE_SECONDS
+		sampledLayer = ReadPlateLayer
+		' A bounce back to the current layer must never reset Count.
+		If sampledLayer = Layer Then
+			Exit Function
+		EndIf
+		If sampledLayer <> candidateLayer Then
+			' Compare the complete 3-bit code, not just "different from Layer".
+			candidateLayer = sampledLayer
+			TmReset LAYER_DEBOUNCE_TIMER
+		ElseIf Tmr(LAYER_DEBOUNCE_TIMER) >= LAYER_STABLE_SECONDS Then
+			confirmedLayer = candidateLayer
+			IsLayerChanged = True
+			Print "Stable layer change. Old:", Layer, " New:", confirmedLayer
+			Exit Function
+		EndIf
+	Loop
 Fend
 	
-Function UpdateLayer
-	Integer B0, B1, B2, NLayer
-	If (Sw(plateBit0)) = On Then
-		B0 = 1
+Function UpdateLayer(NLayer As Integer)
+	' Caller supplies one snapshot. Keep the existing Arduino echo protocol.
+	If (NLayer And 1) <> 0 Then
 		On plateConfirmBit0
 	Else
-		B0 = 0
 		Off plateConfirmBit0
 	EndIf
-	If (Sw(plateBit1)) = On Then
-		B1 = 2
+	If (NLayer And 2) <> 0 Then
 		On plateConfirmBit1
 	Else
-		B1 = 0
 		Off plateConfirmBit1
 	EndIf
-	If (Sw(plateBit2)) = On Then
-		B2 = 4
+	If (NLayer And 4) <> 0 Then
 		On plateConfirmBit2
 	Else
-		B2 = 0
 		Off plateConfirmBit2
 	EndIf
 
-	NLayer = B0 + B1 + B2
 	Print "Old Layer:", Layer, " New Layer:", NLayer
 	Layer = NLayer
 Fend

@@ -27,6 +27,7 @@ from main import (  # noqa: E402
     CaptureSettingsStore,
     CaptureWorker,
     CAMERA_BUFFER_COUNT,
+    MAX_CAPTURE_QUEUE,
     MAX_VALUE,
     MIN_VALUE,
     STEP,
@@ -324,7 +325,7 @@ class AdjustmentTests(unittest.TestCase):
             )
 
     def test_epson_np_trigger_precedes_pick_fixture_motion(self) -> None:
-        program_text = (REPOSITORY_DIR / "robot" / "Main.prg").read_text(
+        program_text = (REPOSITORY_DIR / "robot" / "VT6" / "Main.prg").read_text(
             encoding="utf-8"
         )
         self.assertIn('Print #202, "NP"', program_text)
@@ -335,8 +336,8 @@ class AdjustmentTests(unittest.TestCase):
         pick_fixture = program_text.split("Function Pick_Fixture", 1)[1]
         pick_fixture = pick_fixture.split("Fend", 1)[0]
         self.assertLess(
-            pick_fixture.index("MemOn RpiNpReq"),
-            pick_fixture.index("Move P_Drop_NP"),
+            pick_fixture.upper().index("MEMON RPINPREQ"),
+            pick_fixture.upper().index("MOVE P_DROP_NP"),
         )
 
     def test_persistent_worker_captures_a_fresh_frame_and_releases_it(self) -> None:
@@ -584,6 +585,48 @@ class AdjustmentTests(unittest.TestCase):
         self.assertTrue(results[0].was_bypassed)
         self.assertTrue(camera.request.released)
 
+    def test_np_capture_never_runs_ai_with_any_save_or_bypass_setting(self) -> None:
+        for save_image in (False, True):
+            for bypass_inspection in (False, True):
+                with self.subTest(save=save_image, bypass=bypass_inspection):
+                    request = mock.Mock()
+                    request.get_metadata.return_value = {"SensorTimestamp": 123}
+                    camera = mock.Mock()
+                    camera.capture_request.return_value = request
+                    engine = mock.Mock()
+                    engine.inspect.side_effect = AssertionError("NP must not run AI")
+                    image_saver = mock.Mock()
+                    worker = CaptureWorker(
+                        warmup_seconds=0.0, image_saver=image_saver
+                    )
+                    results, failures, completed = [], [], []
+                    worker.inspection_completed.connect(results.append)
+                    worker.inspection_failed.connect(
+                        lambda kind, message: failures.append((kind, message))
+                    )
+                    worker.failed.connect(failures.append)
+                    worker.succeeded.connect(
+                        lambda path, saved: completed.append((path, saved))
+                    )
+
+                    with tempfile.TemporaryDirectory() as temporary_directory:
+                        path = Path(temporary_directory) / "np.jpg"
+                        worker.capture_one(
+                            camera, path, save_image=save_image,
+                            inspection_kind="NP", inspection_engine=engine,
+                            bypass_inspection=bypass_inspection,
+                        )
+                        self.assertEqual(completed, [(str(path), save_image)])
+                        if save_image:
+                            image_saver.assert_called_once_with(request, path)
+                        else:
+                            image_saver.assert_not_called()
+
+                    engine.inspect.assert_not_called()
+                    self.assertEqual(results, [])
+                    self.assertEqual(failures, [])
+                    request.release.assert_called_once()
+
     def test_low_confidence_ok_is_saved_in_review_only_mode(self) -> None:
         result = InspectionResult(
             command="GLUE",
@@ -805,8 +848,33 @@ class AdjustmentTests(unittest.TestCase):
 
         server.handle_command("INNER", response_session=7)
         server.handle_command("GLUE", response_session=7)
+        server.handle_command("NP", response_session=7)
 
-        self.assertEqual(responses, [("INNER,OK", 7), ("GLUE,OK", 7)])
+        self.assertEqual(
+            responses, [("INNER,OK", 7), ("GLUE,OK", 7), ("NP,OK", 7)]
+        )
+
+    def test_np_queue_full_returns_ok_without_starting_a_capture(self) -> None:
+        controller = CameraController()
+        controller.ready = True
+        controller.capture = mock.Mock()
+        server = Vt6TrainingServer(controller, lambda: {}, port=0)
+        responses = []
+        server.send_response = (
+            lambda response, response_session=None: responses.append(
+                (response, response_session)
+            ) or True
+        )
+        waiting_job = (
+            "INNER", Path("captures/inner.jpg"), None, 7, False, False
+        )
+        server.capture_queue.extend([waiting_job] * MAX_CAPTURE_QUEUE)
+
+        server.handle_command("NP", response_session=7)
+
+        self.assertEqual(responses, [("NP,OK", 7)])
+        self.assertEqual(len(server.capture_queue), MAX_CAPTURE_QUEUE)
+        controller.capture.assert_not_called()
 
     def test_production_capture_failure_also_forces_ok(self) -> None:
         controller = CameraController()
@@ -818,18 +886,20 @@ class AdjustmentTests(unittest.TestCase):
             )
             or True
         )
-        server.active_capture = (
-            "INNER",
-            Path("captures/inner.jpg"),
-            None,
-            9,
-            False,
-            False,
+        for command in ("INNER", "GLUE", "NP"):
+            server.active_capture = (
+                command,
+                Path(f"captures/{command.lower()}.jpg"),
+                None,
+                9,
+                False,
+                False,
+            )
+            server.capture_failed("simulated camera failure")
+
+        self.assertEqual(
+            responses, [("INNER,OK", 9), ("GLUE,OK", 9), ("NP,OK", 9)]
         )
-
-        server.capture_failed("simulated camera failure")
-
-        self.assertEqual(responses, [("INNER,OK", 9)])
 
     @classmethod
     def wait_until(cls, condition, timeout_seconds=1.0):

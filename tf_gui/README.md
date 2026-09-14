@@ -68,7 +68,7 @@ X/Y/Z/U 调整数值，固定步长为 0.05，允许范围为 -0.50～+0.50。
 第一次升级到本版本时，进入`Camera Results`页面，把正常产品和正常生产照明放好，然后点击
 `Auto Calibrate & Lock`。程序让自动曝光和自动白平衡运行约 2 秒，读取`ExposureTime`、
 `AnalogueGain`和`ColourGains`，立即关闭自动控制，并把这些值写入上述 JSON 文件。
-在完成这一步之前，手动拍摄和`INNER/GLUE/NP`生产触发均不会拍照；生产指令会返回`NG`。
+在完成这一步之前，手动拍摄和`INNER/GLUE/NP`生产触发均不会拍照；当前测试版本的生产指令仍返回`OK`。
 
 以后每次启动，程序都会在摄像头开始输出第一帧之前加载固定值，并明确设置
 `AeEnable=false`和`AwbEnable=false`。所有手动、生产和故障触发都使用同一组参数；只有再次点击
@@ -126,6 +126,11 @@ NP,OK\r\n
 
 当前为调试运行阶段：即使页面显示模型判断为NG、模型加载失败、摄像头未就绪、队列已满
 或拍摄失败，TCP也仍然只返回`INNER,OK`、`GLUE,OK`或`NP,OK`，不会输出NG。
+
+`NP`当前只拍照并按保存选项处理图片，不运行分类模型，固定回复`NP,OK`。
+Epson 的 NG 停机逻辑已改为：收到 NG 后锁存 Memory I/O `RpiNgStopReq`，
+在下一次执行到 `Pick_Part` 指定检查点时才执行等待、退回和退出。
+当前摄像头测试模式不会主动触发该停机逻辑；详见 [VT6 机器人设置](../robot/VT6/README.md)。
 手动拍摄仍保存在`captures/YYYYMMDD/`。机器人故障字符串仍写入统一日志并在
 `error_records/`中保存逆时针旋转 90° 的故障照片。
 

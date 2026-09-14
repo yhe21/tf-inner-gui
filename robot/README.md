@@ -1,66 +1,25 @@
-# VT6 / Raspberry Pi communication setup
+# Epson 机器人程序
 
-`Main.prg` is the TF program with all Raspberry Pi socket access isolated in
-`RpiNet`. Configure Epson TCP/IP port `#202` in the controller instead of
-hard-coding an address in SPEL+:
+两个控制器的主程序按机器分别保存，不要混用：
 
-- Mode used by the program: Client
-- Host: Raspberry Pi wired IPv4 address: `192.168.0.20`
-- TCP port: `5000`
+- [VT6/Main.prg](VT6/Main.prg)：与 Raspberry Pi 通讯、取放 part/NP、正常摆盘的 VT6 程序。
+  保留当前版本的盘号防抖和 `RpiNgStopReq` 延后停机逻辑。
+  TCP 设置、Memory I/O 标签和使用注意事项见 [VT6 说明](VT6/README.md)。
+- [T6/Main.prg](T6/Main.prg)：用户上传的另一台 Epson T6 程序，包含
+  nameplate tray、inner 和 glue/stamp 的协调流程。
+  本次只复制归档，没有修改其程序逻辑。来源见 [T6 说明](T6/README.md)。
 
-The Epson controller is currently `192.168.0.21/24`, so both devices are on
-the same wired subnet.
+原来的 `robot/Main.prg` 已移动至 `robot/VT6/Main.prg`，不再保留重复入口。
+树莓派 GUI 的入口仍为 `tf_gui/main.py`，此次整理不改变树莓派启动方式。
 
-Create only these four Memory I/O labels on unused bit numbers in Epson RC+:
+这里只保存已提供的主程序，不是完整 Epson RC+ 项目。点位、工具、I/O 标签和
+控制器配置仍属于各自机器，导入前必须确认控制器型号及对应项目，不能把一个机器的
+`Main.prg` 加载到另一台机器上。
 
-| Label | Writer | Purpose |
-| --- | --- | --- |
-| `RpiInnerReq` | robot cycle | Request `INNER` capture |
-| `RpiGlueReq` | robot cycle | Request `GLUE` capture |
-| `RpiNpReq` | robot cycle | Request `NP` capture |
-| `RpiCalibReq` | robot cycle | Request the 12 calibration values |
-
-The robot never waits for Raspberry Pi availability. A request bit remains on
-while disconnected and is cleared only after `RpiNet` sends the corresponding
-command. `INNER`, `GLUE`, and `NP` results are read
-asynchronously, so robot motion does not wait for image processing. An NG
-result becomes `NO_INNER`, `NO_GLUE`, or `NO_NP`, is sent to the Raspberry Pi for fault
-logging, and then stops the robot program.
-
-`CALIB` is requested near the beginning of `Pick_Part`, but the robot does not
-wait for the response. Coordinates start at zero and remain usable while the
-RPi is offline. If only part of the response arrives, each available valid
-value is applied independently and missing values retain their current value.
-The fixed value order is:
+从仓库根目录运行机器人离线检查：
 
 ```text
-NP_X,NP_Y,NP_Z,NP_U,NPS_X,NPS_Y,NPS_Z,NPS_U,DROP_X,DROP_Y,DROP_Z,DROP_U
+python -m unittest discover -s robot/tests -v
 ```
 
-The Raspberry Pi protocol must terminate every command and response with
-CR/LF. `Print #202` and `Line Input #202` provide that line-based interface.
-
-All fatal robot paths call `FatalError` with one text code. It uses one shared
-internal message slot instead of more Memory I/O bits, lets `RpiNet` send the
-code when connected, and then executes `Quit All`. Logging is best effort: it
-waits at most 0.2 seconds when connected and does not wait at all while offline.
-
-Current fault codes include:
-
-```text
-NO_INNER
-NO_GLUE
-NO_NP
-NO_PART_FROM_CONVEYOR
-PICK_PART_NO_VAC
-PICK_PART_WAIT_TIMEOUT
-DROP_PART_WAIT_TIMEOUT
-PICK_NP_NO_VAC
-NP_LOCATION_INVALID
-DROP_NP_WAIT_TIMEOUT
-PICK_FIXTURE_WAIT_TIMEOUT
-PICK_FIXTURE_NO_VAC
-PALLET_NOT_READY
-SECOND_PLACE_TIMEOUT
-CALI_STOP
-```
+这些检查不会驱动机器人，也不替代 RC+ 编译和现场验证。
