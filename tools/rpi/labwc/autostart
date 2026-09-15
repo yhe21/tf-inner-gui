@@ -1,0 +1,5 @@
+#!/bin/sh
+# Copy this file to ~/.config/labwc/autostart after backing up the old file.
+# Keep any unrelated desktop startup entries from your existing file.
+# Use only this TF GUI entry; do not also start main.py directly.
+/usr/bin/python3 "$HOME/tf-inner-gui/tools/start_rpi.py" &

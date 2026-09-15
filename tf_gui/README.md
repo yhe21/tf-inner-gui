@@ -217,24 +217,35 @@ Qt 和 OpenGL 使用树莓派系统已经安装的 `python3-pyqt5`、`python3-op
 `tools/start_rpi.py` 使用树莓派自带的 Python 标准库，不需要安装新依赖。
 它取代原来 labwc 中的直接启动命令，不要保留两条启动 GUI 的入口。
 
-首次安装时在树莓派上执行：
+已提供可以直接复制的启动文件：[tools/rpi/labwc/autostart](../tools/rpi/labwc/autostart)。
+文件名必须是 `autostart`，没有 `.sh` 或 `.txt` 后缀。复制到当前用户的
+`~/.config/labwc/` 文件夹；当前机器的完整目标路径是 `/home/y/.config/labwc/autostart`。
+这是 [labwc 官方支持的桌面启动入口](https://labwc.github.io/labwc-config.5.html)。
+
+你之前截图中的原文件只有一条 TF GUI 启动命令，可以备份后直接替换。
+如果后来添加了其他启动项目，请保留那些行，只替换 TF GUI 的启动行，不要整份覆盖。
+在停机空闲时，先退出 GUI，再在树莓派上执行一次：
 
 ```bash
 cd ~/tf-inner-gui
 git pull --ff-only
+mkdir -p ~/.config/labwc
 cp -p ~/.config/labwc/autostart ~/.config/labwc/autostart.backup-$(date +%Y%m%d_%H%M%S)
-nano ~/.config/labwc/autostart
+cp tools/rpi/labwc/autostart ~/.config/labwc/autostart
 ```
 
-只将原来的 `(sleep 3; cd /home/y/tf-inner-gui/tf_gui && ... main.py --fullscreen ...) &`
-那一行替换为下面这一行，其余桌面自启动项目保持不变：
+也可以用文件管理器完成备份和复制，按 `Ctrl+H` 显示隐藏的 `.config` 文件夹。
+不要把 `start_rpi.py` 移到启动目录，它应保留在仓库的 `tools/` 中。
+复制的 `autostart` 内唯一的启动命令是：
 
 ```bash
-/usr/bin/python3 /home/y/tf-inner-gui/tools/start_rpi.py &
+/usr/bin/python3 "$HOME/tf-inner-gui/tools/start_rpi.py" &
 ```
 
-保存后，在停机空闲时重新启动树莓派。不要在原 GUI 仍运行时手动运行新的启动入口。
-`/home/y` 来自当前机器的用户名；其他机器请替换为自己的仓库实际路径。
+`$HOME` 自动使用当前登录用户的主目录，仓库仍需放在 `~/tf-inner-gui`。
+文件已固定使用 Linux 换行符，不需要编辑或设置可执行权限；labwc 会通过 shell 读取它。
+首次安装且没有旧 `autostart` 时，跳过备份那一行即可。复制完毕后在停机空闲时重启树莓派。
+不要在原 GUI 仍运行时手动运行新的启动入口；只保留一个 TF GUI 启动入口。
 
 启动行为：
 

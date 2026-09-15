@@ -23,6 +23,22 @@ def result(text="", code=0):
 
 
 class StartupTests(unittest.TestCase):
+    def test_copy_ready_autostart_has_one_background_launcher(self):
+        template = SCRIPT.parent / "rpi" / "labwc" / "autostart"
+        contents = template.read_bytes()
+        self.assertTrue(contents.startswith(b"#!/bin/sh\n"))
+        self.assertNotIn(b"\r", contents)
+        commands = [line for line in contents.decode("ascii").splitlines()
+                    if line.strip() and not line.startswith("#")]
+        self.assertEqual(commands, [
+            '/usr/bin/python3 "$HOME/tf-inner-gui/tools/start_rpi.py" &',
+        ])
+
+    def test_git_preserves_linux_line_endings_for_autostart(self):
+        attributes = SCRIPT.parent.parent / ".gitattributes"
+        self.assertIn("tools/rpi/labwc/autostart text eol=lf",
+                      attributes.read_text(encoding="utf-8").splitlines())
+
     def run_update(self, responses):
         with mock.patch.object(startup, "run_git", side_effect=responses) as git:
             with redirect_stdout(io.StringIO()) as output:

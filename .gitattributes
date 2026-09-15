@@ -1,0 +1,2 @@
+# Keep the copy-ready Raspberry Pi startup file compatible with /bin/sh.
+tools/rpi/labwc/autostart text eol=lf
