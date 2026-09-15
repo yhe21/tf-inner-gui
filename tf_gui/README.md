@@ -212,6 +212,53 @@ python3 main.py --fullscreen
 
 Qt 和 OpenGL 使用树莓派系统已经安装的 `python3-pyqt5`、`python3-opengl`，不需要再次用 pip 安装。
 
+## 开机检查更新后启动 GUI
+
+`tools/start_rpi.py` 使用树莓派自带的 Python 标准库，不需要安装新依赖。
+它取代原来 labwc 中的直接启动命令，不要保留两条启动 GUI 的入口。
+
+首次安装时在树莓派上执行：
+
+```bash
+cd ~/tf-inner-gui
+git pull --ff-only
+cp -p ~/.config/labwc/autostart ~/.config/labwc/autostart.backup-$(date +%Y%m%d_%H%M%S)
+nano ~/.config/labwc/autostart
+```
+
+只将原来的 `(sleep 3; cd /home/y/tf-inner-gui/tf_gui && ... main.py --fullscreen ...) &`
+那一行替换为下面这一行，其余桌面自启动项目保持不变：
+
+```bash
+/usr/bin/python3 /home/y/tf-inner-gui/tools/start_rpi.py &
+```
+
+保存后，在停机空闲时重新启动树莓派。不要在原 GUI 仍运行时手动运行新的启动入口。
+`/home/y` 来自当前机器的用户名；其他机器请替换为自己的仓库实际路径。
+
+启动行为：
+
+- 桌面启动后等待3秒，检查 `origin/main`，然后全屏启动 GUI；生产运行期间不会自动检查、更新或重启。
+- 只有当前分支为 `main` 且受 Git 管理的文件没有本地修改时才检查更新；不会执行强制覆盖、自动暂存、重置或变基。
+- 下载最多等待45秒，不弹出账号密码窗口；断网、下载失败、超时或本地提交无法直接更新时，继续启动现有本地版本。
+- 使用 `fetch` 下载，再用 `merge --ff-only` 更新程序和模型。超时只限制下载，不在文件更新途中强行终止 Git。
+- 同一个启动脚本重复运行时，第二个实例会退出；这不替代“删除旧启动入口”，也不会关闭手动启动的 GUI。
+- 不自动安装 Python 依赖，也不自动回滚一个成功下载但自身运行出错的新版本；推送生产更新前仍需完成测试。
+
+更新情况和 GUI 日志仍在原位置，每次有效启动覆盖上次日志：
+
+```bash
+tail -n 100 ~/.local/state/tf_inner/startup.log
+```
+
+需要延长下载等待时间时，可以把自启动命令改为：
+
+```bash
+/usr/bin/python3 /home/y/tf-inner-gui/tools/start_rpi.py --update-timeout 90 &
+```
+
+临时禁止自动更新但保留开机启动时，把参数改为 `--skip-update`。
+
 ## 查看触摸屏分辨率
 
 在树莓派桌面的终端中执行：
