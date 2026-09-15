@@ -193,16 +193,16 @@ QDialog#CameraMonitorDialog {
 
 QLabel#lblCameraPageTitle {
     color: #12345b;
-    font-size: 30px;
+    font-size: 28px;
     font-weight: 700;
 }
 
 QLabel#lblCaptureMode {
-    padding: 8px 14px;
+    padding: 6px 10px;
     color: #075d66;
     background-color: #d9f3f5;
     border-radius: 8px;
-    font-size: 17px;
+    font-size: 15px;
     font-weight: 700;
 }
 
@@ -265,26 +265,26 @@ QLabel#lblCapturedImage {
 
 QLabel#lblCameraPageStatus {
     color: #475569;
-    font-size: 17px;
+    font-size: 15px;
     font-weight: 600;
 }
 
 QCheckBox#chkSaveProductionImages,
 QCheckBox#chkBypassInspection {
-    min-height: 48px;
-    padding: 4px 12px;
+    min-height: 36px;
+    padding: 3px 10px;
     color: #12345b;
     background-color: #ffffff;
     border: 1px solid #cbd5e1;
     border-radius: 10px;
-    font-size: 19px;
+    font-size: 17px;
     font-weight: 700;
 }
 
 QCheckBox#chkSaveProductionImages::indicator,
 QCheckBox#chkBypassInspection::indicator {
-    width: 30px;
-    height: 30px;
+    width: 26px;
+    height: 26px;
 }
 
 QCheckBox#chkBypassInspection:checked {

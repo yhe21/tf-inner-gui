@@ -907,6 +907,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
         uic.loadUi(str(CAMERA_MONITOR_UI_FILE), self)
         self.camera_controller = camera_controller
         self.last_capture_path: Optional[Path] = None
+        self._preview_image_path: Optional[Path] = None
 
         self.chkSaveProductionImages.setChecked(production_save_enabled)
         self.chkBypassInspection.setChecked(inspection_bypass_enabled)
@@ -966,9 +967,9 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             return f"{result.command}: OK | INSPECTION BYPASSED"
         return (
             f"{result.command}: {result.overall_label} | "
+            f"AI {result.elapsed_ms:.0f} ms\n"
             f"L {result.left.label} {result.left.confidence * 100:.1f}% | "
-            f"R {result.right.label} {result.right.confidence * 100:.1f}% | "
-            f"AI {result.elapsed_ms:.0f} ms"
+            f"R {result.right.label} {result.right.confidence * 100:.1f}%"
         )
 
     def result_label(self, command: str) -> QtWidgets.QLabel:
@@ -1072,7 +1073,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
                 f"Gain {float(settings['analogue_gain']):.2f}"
             )
         self.lblCaptureMode.setText(
-            f"Saving {saving_text} | {inspection_text} | {exposure_text}"
+            f"Saving {saving_text} | {inspection_text}\n{exposure_text}"
         )
 
     def capture_is_running(self) -> bool:
@@ -1206,21 +1207,30 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
     def show_captured_image(self, image_path: Path) -> None:
         reader = QtGui.QImageReader(str(image_path))
-        target_size = self.lblCapturedImage.size()
+        target_size = self.lblCapturedImage.contentsRect().size()
         image_size = reader.size()
         if image_size.isValid():
             image_size.scale(target_size, QtCore.Qt.KeepAspectRatio)
             reader.setScaledSize(image_size)
         image = reader.read()
         if image.isNull():
+            self._preview_image_path = None
             self.lblCapturedImage.setText(
                 "Image saved, but the preview could not be loaded."
             )
             return
 
-        self.lblCapturedImage.setPixmap(QtGui.QPixmap.fromImage(image))
+        self._preview_image_path = Path(image_path)
         self.lblCapturedImage.setText("")
+        self.lblCapturedImage.setPixmap(QtGui.QPixmap.fromImage(image))
         self.refresh_buttons()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        # Scale only the preview; never modify the saved full-resolution image.
+        image_path = getattr(self, "_preview_image_path", None)
+        if image_path is not None:
+            self.show_captured_image(image_path)
 
     def disconnect_controller(self) -> None:
         connections = (
