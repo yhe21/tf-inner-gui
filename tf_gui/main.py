@@ -41,7 +41,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -1629,7 +1629,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str, bool)
     def update_camera_status(self, status_text: str, is_ready: bool) -> None:
-        self.lblCameraStatus.setText(f"● {status_text}")
+        # Keep the main header compact; the camera page retains full details.
+        display_text = status_text
+        if status_text.startswith("Camera ready"):
+            display_text = "Camera ready" if is_ready else "Not calibrated"
+        self.lblCameraStatus.setText(f"● {display_text}")
+        self.lblCameraStatus.setToolTip(status_text)
         self.lblCameraStatus.setProperty("statusOk", is_ready)
         self.lblCameraStatus.style().unpolish(self.lblCameraStatus)
         self.lblCameraStatus.style().polish(self.lblCameraStatus)

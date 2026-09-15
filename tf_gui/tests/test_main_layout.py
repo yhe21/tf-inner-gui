@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 from main import (  # noqa: E402
-    APP_VERSION, AdjustmentStore, CameraController, CameraSettingsStore,
+    APP_VERSION, AdjustmentStore, CameraController, CameraMonitorDialog, CameraSettingsStore,
     CaptureSettingsStore, MainWindow,
 )
 
@@ -60,6 +60,53 @@ class MainLayoutTests(unittest.TestCase):
                 start.assert_called_once()
                 self.assertIsNone(window.vt6_server)
             finally:
+                window.close()
+
+    def test_compact_camera_header_preserves_details_and_not_ready_states(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CameraController, "start"):
+            root = Path(directory)
+            window = MainWindow(
+                store=AdjustmentStore(root / "adjustments.json"),
+                capture_settings_store=CaptureSettingsStore(root / "capture.json"),
+                camera_settings_store=CameraSettingsStore(root / "camera.json"),
+                tcp_enabled=False,
+            )
+            controller = window.camera_controller
+            dialog = CameraMonitorDialog(controller, window)
+            try:
+                window.resize(1024, 600)
+                window.show()
+                window.update_vt6_status("VT6 waiting on port 5000", False)
+                for locked in (True, False):
+                    with self.subTest(locked=locked):
+                        controller.on_ready(4056, 3040, locked)
+                        self.app.processEvents()
+                        expected = "Camera ready" if locked else "Not calibrated"
+                        self.assertEqual(window.lblCameraStatus.text(), f"● {expected}")
+                        self.assertEqual(window.lblCameraStatus.property("statusOk"), locked)
+                        self.assertEqual(controller.ready, locked)
+                        self.assertIn("4056x3040", controller.status_text)
+                        self.assertEqual(window.lblCameraStatus.toolTip(), controller.status_text)
+                        self.assertEqual(dialog.lblCameraPageStatus.text(), controller.status_text)
+                        self.assertGreaterEqual(window.lblCameraStatus.width(),
+                                                window.lblCameraStatus.sizeHint().width())
+
+                controller.on_auto_calibration_succeeded({
+                    "exposure_time_us": 12000, "analogue_gain": 1.25,
+                    "colour_gains": [1.7, 1.4],
+                })
+                self.assertEqual(window.lblCameraStatus.text(), "● Camera ready")
+                self.assertTrue(window.lblCameraStatus.property("statusOk"))
+                self.assertTrue(controller.ready)
+
+                controller.on_initialization_failed("Camera unavailable")
+                self.assertEqual(window.lblCameraStatus.text(), "● Camera error: Camera unavailable")
+                self.assertFalse(window.lblCameraStatus.property("statusOk"))
+                window.update_camera_status("Camera starting...", False)
+                self.assertEqual(window.lblCameraStatus.text(), "● Camera starting...")
+            finally:
+                dialog.close()
                 window.close()
 
 
