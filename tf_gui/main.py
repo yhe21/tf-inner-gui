@@ -41,7 +41,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -1536,8 +1536,8 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         super().__init__()
         uic.loadUi(str(UI_FILE), self)
-        self.setWindowTitle(f"TF Inner Inspection System v{APP_VERSION}")
-        self.lblTitle.setText(f"TF Inner Inspection v{APP_VERSION}")
+        self.setWindowTitle(f"TF Inspection v{APP_VERSION}")
+        self.lblTitle.setText(f"TF Inspection v{APP_VERSION}")
 
         if STYLE_FILE.exists():
             self.setStyleSheet(STYLE_FILE.read_text(encoding="utf-8"))
