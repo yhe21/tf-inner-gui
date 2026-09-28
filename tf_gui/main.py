@@ -44,7 +44,8 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.6"
+APP_VERSION = "0.4.7"
+GLUE_NG_THRESHOLD = 3
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -375,9 +376,6 @@ class CaptureWorker(QtCore.QObject):
         request = None
         image_was_saved = False
         try:
-            if save_image:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-
             # flush=True guarantees that exposure starts no earlier than trigger time.
             request = self.request_frame(camera)
             metadata = request.get_metadata()
@@ -388,23 +386,23 @@ class CaptureWorker(QtCore.QObject):
 
             if inspection_kind in {"INNER", "GLUE"}:
                 if bypass_inspection:
-                    if save_image:
-                        self.image_saver(request, output_path)
-                        image_was_saved = True
                     self.inspection_completed.emit(
                         InspectionResult.forced_ok(inspection_kind)
                     )
-                elif inspection_engine is None:
                     if save_image:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
                         self.image_saver(request, output_path)
                         image_was_saved = True
+                elif inspection_engine is None:
                     message = inspection_load_error or "AI models are not available"
                     self.inspection_failed.emit(inspection_kind, message)
+                    if save_image:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        self.image_saver(request, output_path)
+                        image_was_saved = True
                 else:
                     rotated_image = counterclockwise_rotated_image(request)
-                    if save_image:
-                        save_rotated_jpeg(rotated_image, output_path)
-                        image_was_saved = True
+                    review_image = False
                     try:
                         result = inspection_engine.inspect(
                             inspection_kind, rotated_image
@@ -412,12 +410,16 @@ class CaptureWorker(QtCore.QObject):
                     except Exception as error:
                         self.inspection_failed.emit(inspection_kind, str(error))
                     else:
-                        if not image_was_saved and requires_review_save(result):
-                            output_path.parent.mkdir(parents=True, exist_ok=True)
-                            save_rotated_jpeg(rotated_image, output_path)
-                            image_was_saved = True
+                        # Report the verdict before disk I/O: JPEG failure must
+                        # never suppress an already computed production NG.
                         self.inspection_completed.emit(result)
+                        review_image = requires_review_save(result)
+                    if save_image or review_image:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        save_rotated_jpeg(rotated_image, output_path)
+                        image_was_saved = True
             elif save_image:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
                 self.image_saver(request, output_path)
                 image_was_saved = True
             self.succeeded.emit(str(output_path), image_was_saved)
@@ -797,11 +799,14 @@ class Vt6TrainingServer(QtCore.QObject):
         self.current_session_id: Optional[int] = None
         self.capture_queue: Deque[CaptureJob] = deque()
         self.active_capture: Optional[CaptureJob] = None
+        self.active_response_handled = False
+        self.glue_ng_streak = 0
 
         self.server.newConnection.connect(self.accept_connection)
         self.camera_controller.status_changed.connect(self.camera_status_changed)
         self.camera_controller.capture_succeeded.connect(self.capture_succeeded)
         self.camera_controller.capture_failed.connect(self.capture_failed)
+        self.camera_controller.inspection_completed.connect(self.inspection_completed)
 
     def start(self) -> bool:
         if not self.server.listen(QtNetwork.QHostAddress.AnyIPv4, self.port):
@@ -814,6 +819,7 @@ class Vt6TrainingServer(QtCore.QObject):
         return True
 
     def stop(self) -> None:
+        self.reset_glue_ng_streak()
         if self.current_client is not None:
             self.current_client.disconnectFromHost()
         for client in list(self.client_buffers):
@@ -838,6 +844,7 @@ class Vt6TrainingServer(QtCore.QObject):
             self.next_session_id += 1
             self.client_sessions[new_client] = session_id
             self.current_session_id = session_id
+            self.reset_glue_ng_streak()
             new_client.readyRead.connect(
                 lambda client=new_client: self.read_client(client)
             )
@@ -854,6 +861,7 @@ class Vt6TrainingServer(QtCore.QObject):
         self.client_buffers.pop(client, None)
         self.client_sessions.pop(client, None)
         if self.current_client is client:
+            self.reset_glue_ng_streak()
             self.current_client = None
             self.current_session_id = None
             if self.server.isListening():
@@ -905,12 +913,11 @@ class Vt6TrainingServer(QtCore.QObject):
         self, command: str, response_session: Optional[int] = None
     ) -> None:
         if not self.camera_controller.ready:
-            # Training/commissioning mode: never stop the robot from an RPi
-            # camera or model condition. The UI still reports the problem.
-            self.send_response(f"{command},OK", response_session)
+            # No valid inspection: retain the requested fail-open camera policy.
+            self.reply_production(command, response_session)
             return
         if len(self.capture_queue) >= MAX_CAPTURE_QUEUE:
-            self.send_response(f"{command},OK", response_session)
+            self.reply_production(command, response_session)
             return
 
         self.capture_queue.append(
@@ -979,6 +986,7 @@ class Vt6TrainingServer(QtCore.QObject):
             bypass_inspection=job[5],
         ):
             self.active_capture = job
+            self.active_response_handled = False
         else:
             self.capture_queue.appendleft(job)
 
@@ -987,12 +995,13 @@ class Vt6TrainingServer(QtCore.QObject):
         if is_ready:
             self.start_next_capture()
         else:
+            self.reset_glue_ng_streak()
             # The robot does not wait for a camera recovery. Old triggers no
             # longer describe the current workpiece and must not be replayed.
             while self.capture_queue:
                 command, path, error_code, session, _save, _bypass = self.capture_queue.popleft()
                 if command is not None:
-                    self.send_response(f"{command},OK", session)
+                    self.reply_production(command, session)
                 elif error_code is not None:
                     self.append_error_log(error_code, path, "CAMERA_NOT_READY")
 
@@ -1007,12 +1016,10 @@ class Vt6TrainingServer(QtCore.QObject):
                 _save_image,
                 _bypass_inspection,
             ) = self.active_capture
+            if response_command is not None and not self.active_response_handled:
+                self.reply_production(response_command, response_session)
             self.active_capture = None
-
-            if response_command is not None:
-                self.send_response(
-                    f"{response_command},OK", response_session
-                )
+            self.active_response_handled = False
         self.start_next_capture()
 
     @QtCore.pyqtSlot(str)
@@ -1026,18 +1033,78 @@ class Vt6TrainingServer(QtCore.QObject):
                 _save_image,
                 _bypass_inspection,
             ) = self.active_capture
-            self.active_capture = None
-            if response_command is not None:
-                self.send_response(
-                    f"{response_command},OK", response_session
-                )
+            if response_command is not None and not self.active_response_handled:
+                self.reply_production(response_command, response_session)
             elif error_code is not None:
                 self.append_error_log(
                     error_code,
                     output_path,
                     f"CAPTURE_FAILED: {error_message}",
                 )
+            self.active_capture = None
+            self.active_response_handled = False
         self.start_next_capture()
+
+    def reset_glue_ng_streak(self) -> None:
+        self.glue_ng_streak = 0
+
+    @QtCore.pyqtSlot(object)
+    def inspection_completed(self, result: InspectionResult) -> None:
+        job = self.active_capture
+        if (
+            job is None or self.active_response_handled
+            or job[0] not in {"INNER", "GLUE"}
+            or result.command != job[0]
+            or result.overall_label not in {"OK", "NG"}
+        ):
+            return
+        # Retire this response even if its connection has gone away. A later
+        # JPEG completion/failure must not send a second or contradictory reply.
+        self.active_response_handled = True
+        self.reply_production(job[0], job[3], result, bypass=job[5])
+
+    def reply_production(
+        self, command: str, response_session: Optional[int],
+        result: Optional[InspectionResult] = None, bypass: bool = False,
+    ) -> None:
+        # A stale capture must not affect the new connection's GLUE counter.
+        if not self.is_current_connection(response_session):
+            return
+        bypass = bypass or bool(self.inspection_bypass_provider()) or (
+            result is not None and result.was_bypassed
+        )
+        valid_ng = result is not None and result.overall_label == "NG" and not bypass
+        if bypass or (command in {"INNER", "GLUE"} and result is None):
+            self.reset_glue_ng_streak()
+        verdict = "OK"
+        if command == "INNER" and valid_ng:
+            verdict = "NG"
+        elif command == "GLUE":
+            if valid_ng:
+                self.glue_ng_streak = min(GLUE_NG_THRESHOLD, self.glue_ng_streak + 1)
+                if self.glue_ng_streak >= GLUE_NG_THRESHOLD:
+                    verdict = "NG"
+            else:
+                self.reset_glue_ng_streak()
+        response = f"{command},{verdict}"
+        written = self.send_response(response, response_session)
+        # Included in the existing redirected startup log for field diagnosis.
+        with suppress(OSError):
+            print(
+                f"{datetime.now().isoformat(timespec='milliseconds')} Production reply: "
+                f"session={response_session} command={command} "
+                f"AI={result.overall_label if result is not None else 'UNAVAILABLE'} "
+                f"bypass={bypass} glue_ng={self.glue_ng_streak}/{GLUE_NG_THRESHOLD} "
+                f"reply={response} queued={written}", flush=True,
+            )
+
+    def is_current_connection(self, response_session: Optional[int]) -> bool:
+        client = self.current_client
+        return (
+            client is not None
+            and client.state() == QtNetwork.QAbstractSocket.ConnectedState
+            and (response_session is None or response_session == self.current_session_id)
+        )
 
     def send_response(
         self, response: str, response_session: Optional[int] = None
@@ -1054,18 +1121,12 @@ class Vt6TrainingServer(QtCore.QObject):
         self, response: str, response_session: Optional[int] = None
     ) -> bool:
         client = self.current_client
-        if (
-            client is None
-            or client.state() != QtNetwork.QAbstractSocket.ConnectedState
-            or (
-                response_session is not None
-                and response_session != self.current_session_id
-            )
-        ):
+        if not self.is_current_connection(response_session):
             return False
-        client.write((response + "\r\n").encode("ascii"))
+        payload = (response + "\r\n").encode("ascii")
+        queued_bytes = client.write(payload)
         client.flush()
-        return True
+        return queued_bytes == len(payload)
 
 
 class CameraMonitorDialog(QtWidgets.QDialog):
@@ -1867,6 +1928,8 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bool)
     def set_inspection_bypass(self, enabled: bool) -> None:
         self.inspection_bypass = enabled
+        if enabled and self.vt6_server is not None:
+            self.vt6_server.reset_glue_ng_streak()
         try:
             self.capture_settings_store.save_bypass(enabled)
         except OSError as error:

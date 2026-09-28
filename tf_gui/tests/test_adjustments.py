@@ -838,6 +838,9 @@ class AdjustmentTests(unittest.TestCase):
         controller = CameraController()
         controller.ready = False
         server = Vt6TrainingServer(controller, lambda: {}, port=0)
+        server.current_client = mock.Mock()
+        server.current_client.state.return_value = QtNetwork.QAbstractSocket.ConnectedState
+        server.current_session_id = 7
         responses = []
         server.send_response = (
             lambda response, response_session=None: responses.append(
@@ -859,6 +862,9 @@ class AdjustmentTests(unittest.TestCase):
         controller.ready = True
         controller.capture = mock.Mock()
         server = Vt6TrainingServer(controller, lambda: {}, port=0)
+        server.current_client = mock.Mock()
+        server.current_client.state.return_value = QtNetwork.QAbstractSocket.ConnectedState
+        server.current_session_id = 7
         responses = []
         server.send_response = (
             lambda response, response_session=None: responses.append(
@@ -879,6 +885,9 @@ class AdjustmentTests(unittest.TestCase):
     def test_production_capture_failure_also_forces_ok(self) -> None:
         controller = CameraController()
         server = Vt6TrainingServer(controller, lambda: {}, port=0)
+        server.current_client = mock.Mock()
+        server.current_client.state.return_value = QtNetwork.QAbstractSocket.ConnectedState
+        server.current_session_id = 9
         responses = []
         server.send_response = (
             lambda response, response_session=None: responses.append(

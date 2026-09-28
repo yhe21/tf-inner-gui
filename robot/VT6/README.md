@@ -88,9 +88,12 @@ CALI_STOP
   restarting; do not treat this as an automatic recovery procedure.
 - NP remains capture-only: the RPi does not run an NP classifier and replies
   `NP,OK`, including camera-unavailable, queue-full, and capture-failure paths.
-  The existing INNER/GLUE commissioning behavior (always reply OK) is also
-  unchanged; actual NG messages or a deliberately set Memory I/O bit are
-  needed to exercise the new stop branch.
+  RPi GUI v0.4.7 enables production replies: INNER sends NG on each valid NG
+  result; GLUE sends OK for its first two consecutive NG results and NG from
+  the third onward. GLUE OK, invalid inspections, camera unavailability,
+  bypass, or a fresh TCP session reset the streak. Normal INNER/NP captures
+  between GLUE captures do not reset it. Camera/model failures retain the
+  explicitly requested OK fallback. See the GUI README for full semantics.
 - The 0.5-second dwell is the requested delay, not an independently verified
   standstill measurement. Compile the complete RC+ project and validate this
   retreat path, deceleration timing, and normal cycle time under the site's

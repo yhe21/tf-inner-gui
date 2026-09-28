@@ -1,6 +1,6 @@
 # TF Inner GUI
 
-当前版本：`v0.4.6`。主界面名称为 `TF Inspection`，保留版本号；摄像头就绪时仅显示 `Camera ready`，不再附加分辨率和曝光说明。尚未校准时仍提示 `Not calibrated`，摄像头页面保留详细信息。触摸屏菜单和运行状态均使用英文。
+当前版本：`v0.4.7`。主界面名称为 `TF Inspection`，保留版本号；摄像头就绪时仅显示 `Camera ready`，不再附加分辨率和曝光说明。尚未校准时仍提示 `Not calibrated`，摄像头页面保留详细信息。触摸屏菜单和运行状态均使用英文。
 
 ## 相机超时与恢复
 
@@ -25,7 +25,7 @@
 故障与恢复记录保存在 `~/.local/state/tf_inner/camera_recovery.log`（轮转保存），
 重启限制记录保存在 `~/.local/state/tf_inner/camera_reboot.json`。
 
-相机不可用或恢复期间，沿用当前测试协议：`INNER/GLUE/NP` 返回 `OK`，但没有完成拍照或视觉检测；
+相机不可用或恢复期间，按现场要求保留异常放行：`INNER/GLUE/NP` 返回 `OK`，但没有完成拍照或视觉检测，并清零 GLUE 连续 NG 计数；
 `CALIB` 仍返回保存的偏移量。故障代码写入 `error.log` 并标记 `CAMERA_NOT_READY`，没有照片。
 故障时已经排队的旧生产触发被结束，不在恢复后补拍过去的工件；之后的新触发正常采集。
 
@@ -144,21 +144,34 @@ captures/YYYYMMDD/NP/YYYYMMDD_HHMMSS_mmm.jpg
 
 树莓派上的完整位置是`~/tf-inner-gui/tf_gui/captures/`。保存的图片同样逆时针旋转90°。
 关闭`Save all production images`后，INNER/GLUE只保存任一NG或任一OK置信度低于95%的图片；
-NP没有AI结果，因此只在保存全部开启时保存。无论AI判断和是否保存，TCP都固定返回OK：
+NP没有AI结果，因此只在保存全部开启时保存。正式检测回复规则：
+
+- `INNER`：整体检测为 NG 时立即回复 `INNER,NG`，OK 时回复 `INNER,OK`。
+- `GLUE`：按生产触发逐次累计连续 NG；第 1、2 次仍回复 `GLUE,OK`，第 3 次及之后回复 `GLUE,NG`，直到清零。不是同一工件自动重拍三次。
+- GLUE 检出 OK、相机不可用、INNER/GLUE 没有有效检测结果、开启旁路、TCP 重新连接或应用重启时清零。期间正常的 INNER/NP/CALIB、手动拍照及故障留图不打断 GLUE 计数。
+- 旁路开启时始终回复 OK；请求入队时已开启旁路的任务也保留强制 OK。
+- 有效结果计算完成就回复，不等待 JPEG 保存；保存失败不会覆盖已经发出的结果，也不会再补发 OK。GLUE 前两次 NG 仍按原规则显示并保存复查照片。
+
+回复示例：
 
 ```text
 INNER,OK\r\n
+INNER,NG\r\n
 GLUE,OK\r\n
+GLUE,NG\r\n
 NP,OK\r\n
 ```
 
-当前为调试运行阶段：即使页面显示模型判断为NG、模型加载失败、摄像头未就绪、队列已满
-或拍摄失败，TCP也仍然只返回`INNER,OK`、`GLUE,OK`或`NP,OK`，不会输出NG。
+模型加载/计算失败、摄像头未就绪、队列已满或未取得有效检测结果的拍摄失败，
+按现场确认的异常策略仍回复 OK，并清零相关检测连续计数；这些 OK 不代表视觉检测合格。
+检测阈值仍为左右均 OK 且置信度均不低于 90%；95% 仅为复查照片保存阈值。
+`startup.log` 中的 `Production reply` 记录检测值、GLUE 计数和回复；`queued=True`
+表示数据交给 TCP 发送缓冲区，不代表机器人已确认接收。
 
 `NP`当前只拍照并按保存选项处理图片，不运行分类模型，固定回复`NP,OK`。
 Epson 的 NG 停机逻辑已改为：收到 NG 后锁存 Memory I/O `RpiNgStopReq`，
 在下一次执行到 `Pick_Part` 指定检查点时才执行等待、退回和退出。
-当前摄像头测试模式不会主动触发该停机逻辑；详见 [VT6 机器人设置](../robot/VT6/README.md)。
+正式检测的 NG 回复会触发该停机逻辑；详见 [VT6 机器人设置](../robot/VT6/README.md)。
 手动拍摄仍保存在`captures/YYYYMMDD/`。机器人故障字符串仍写入统一日志并在
 `error_records/`中保存逆时针旋转 90° 的故障照片。
 
