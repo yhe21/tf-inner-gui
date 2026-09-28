@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import json
 import math
 import multiprocessing
+from multiprocessing.connection import wait
 from pathlib import Path
 import platform
 import queue
@@ -25,12 +26,10 @@ class RecoveryLimits:
     capture_timeout: float = 5.0
     processing_timeout: float = 30.0
     calibration_timeout: float = 10.0
-    health_interval: float = 5.0
     retry_delay: float = 3.0
     initial_retry_delay: float = 10.0
     max_retries: int = 10
     shutdown_timeout: float = 1.0
-    poll_interval: float = 0.05
 
     def __post_init__(self) -> None:
         for name, value in vars(self).items():
@@ -103,6 +102,38 @@ class _CameraUnavailable(Exception):
     pass
 
 
+class WakeableQueue(queue.Queue):
+    """A thread queue whose nonempty state is a waitable pipe signal.
+
+    Queue's mutex serializes both transitions. At most one tiny message is in
+    the pipe, so a GUI producer never fills a notification pipe while a camera
+    operation is busy. Taking the last item clears the signal under that same
+    lock; a concurrent producer cannot lose its wakeup.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.reader, self._writer = multiprocessing.Pipe(duplex=False)
+
+    def _put(self, item):
+        was_empty = not self._qsize()
+        super()._put(item)
+        if was_empty:
+            self._writer.send_bytes(b"1")
+
+    def _get(self):
+        item = super()._get()
+        if not self._qsize():
+            self.reader.recv_bytes()
+        return item
+
+    def close(self):
+        """Release notifications once all producers and the consumer stopped."""
+        with self.mutex:
+            self.reader.close()
+            self._writer.close()
+
+
 class CameraProcessSupervisor:
     """Own one child at a time and report its events from the caller's thread.
 
@@ -113,7 +144,7 @@ class CameraProcessSupervisor:
 
     def __init__(
         self,
-        commands: queue.Queue,
+        commands: WakeableQueue,
         emit: Callable[[str, tuple], None],
         settings: Optional[dict],
         model_root: Optional[str],
@@ -141,7 +172,6 @@ class CameraProcessSupervisor:
         self._connection = None
         self._child_ready = False
         self._startup_probe_ok = False
-        self._last_health = 0.0
         self._reboot_requested = False
 
     def run(self) -> None:
@@ -251,13 +281,19 @@ class CameraProcessSupervisor:
             if self._stopping:
                 return
 
-            # Consume already-arrived completions before checking deadlines.
-            if self._connection.poll(self.limits.poll_interval):
-                for _ in range(256):
-                    name, args = self._connection.recv()
-                    self._handle_event(name, tuple(args))
-                    if not self._connection.poll(0):
-                        break
+            # Drain only events already available; never wait before dispatching
+            # a queued production trigger. Deadlines are checked after draining.
+            for _ in range(256):
+                if not self._connection.poll(0):
+                    break
+                name, args = self._connection.recv()
+                self._handle_event(name, tuple(args))
+
+            # Callbacks and concurrent GUI input may have queued work while
+            # events were drained. Dispatch it before entering any wait.
+            self._collect_commands()
+            if self._stopping:
+                return
 
             if not self._process.is_alive():
                 raise _CameraUnavailable("Camera process exited unexpectedly")
@@ -269,15 +305,29 @@ class CameraProcessSupervisor:
                             "AI initialization timed out after a successful camera probe"
                         )
                     raise _CameraUnavailable("Camera initialization timed out")
-                continue
-            if self._active is not None:
+                timeout = max(0.0, startup_deadline - now)
+            elif self._active is not None:
                 if now >= self._active_deadline:
                     raise _CameraUnavailable(f"Camera {self._active_phase} timed out")
-                continue
-            if self._pending:
-                self._start_operation(self._pending.popleft())
-            elif now - self._last_health >= self.limits.health_interval:
-                self._start_operation(("health_check", None, False, None, False))
+                timeout = max(0.0, self._active_deadline - now)
+            else:
+                if self._pending:
+                    self._start_operation(self._pending.popleft())
+                    if self._active is None:
+                        continue
+                    timeout = max(0.0, self._active_deadline - time.monotonic())
+                else:
+                    timeout = None
+            # Requests, child events and process exit all wake this wait. When
+            # idle there is no timer; during an operation only its deadline is
+            # used. A request arriving here cannot wait for a polling interval.
+            self._wait_for_activity(timeout)
+
+    def _wait_for_activity(self, timeout: Optional[float], child: bool = True) -> None:
+        sources = [self.commands.reader]
+        if child:
+            sources.extend((self._connection, self._process.sentinel))
+        wait(sources, timeout)
 
     def _start_operation(self, command) -> None:
         name = command[0]
@@ -287,9 +337,6 @@ class CameraProcessSupervisor:
         elif name == "auto_calibrate":
             timeout = self.limits.calibration_timeout
             phase = "calibration"
-        elif name == "health_check":
-            timeout = self.limits.capture_timeout
-            phase = "health check"
         else:
             self.emit("failed", (f"Unknown camera command: {name}",))
             return
@@ -307,24 +354,18 @@ class CameraProcessSupervisor:
             self._child_ready = True
             self.ever_ready = True
             self.reconnect_attempts = 0
-            self._last_health = time.monotonic()
-        elif name == "health_checked":
+        elif name == "startup_probe_succeeded":
             if not self._child_ready:
                 # The child probes before loading AI. Repeated AI load hangs
                 # must not accumulate camera failures and reboot healthy hardware.
                 self._startup_probe_ok = True
                 self.reconnect_attempts = 0
-                self._last_health = time.monotonic()
-            if self._active is not None and self._active[0] == "health_check":
-                self._active = None
-                self._last_health = time.monotonic()
             return
         elif name == "frame_acquired":
             if self._active is None or self._active[0] != "capture":
                 return
             self._active_phase = "image processing"
             self._active_deadline = time.monotonic() + self.limits.processing_timeout
-            self._last_health = time.monotonic()
         elif name in {"succeeded", "failed"}:
             if self._active is None or self._active[0] != "capture":
                 return
@@ -334,8 +375,6 @@ class CameraProcessSupervisor:
                 return
             self._active = None
             self.settings = deepcopy(args[0]) if name.endswith("succeeded") else None
-            if name.endswith("succeeded"):
-                self._last_health = time.monotonic()
         elif name in {"inspection_completed", "inspection_failed", "capture_started"}:
             if self._active is None or self._active[0] != "capture":
                 return
@@ -364,10 +403,12 @@ class CameraProcessSupervisor:
         deadline = time.monotonic() + delay
         while not self._stopping:
             self._discard_pending(reason)
+            if self._stopping:
+                return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            time.sleep(min(self.limits.poll_interval, remaining))
+            self._wait_for_activity(remaining, child=False)
 
     def _close_child(self) -> bool:
         process, connection = self._process, self._connection

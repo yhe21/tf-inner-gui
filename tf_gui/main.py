@@ -44,7 +44,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.7"
+APP_VERSION = "0.4.8"
 GLUE_NG_THRESHOLD = 3
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
@@ -157,7 +157,7 @@ class CaptureWorker(QtCore.QObject):
     failed = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
     camera_fault = QtCore.pyqtSignal(str)
-    health_checked = QtCore.pyqtSignal()
+    startup_probe_succeeded = QtCore.pyqtSignal()
     unavailable = QtCore.pyqtSignal(str)
 
     def __init__(
@@ -232,7 +232,7 @@ class CaptureWorker(QtCore.QObject):
             # Without one, AE/AWB may run only so the operator can calibrate.
             time.sleep(self.warmup_seconds)
             if self.validate_startup:
-                self.check_frame(camera)
+                self.check_startup_frame(camera)
 
             if self.inspection_engine_factory is not None:
                 self.inspection_status_changed.emit("AI models loading...", False)
@@ -265,9 +265,6 @@ class CaptureWorker(QtCore.QObject):
                     inspection_kind,
                     bypass_inspection,
                 ) = command
-                if command_name == "health_check":
-                    self.check_frame(camera)
-                    continue
                 if command_name == "auto_calibrate":
                     self.auto_calibrate(camera)
                     continue
@@ -303,14 +300,14 @@ class CaptureWorker(QtCore.QObject):
                 raise CameraAcquisitionError(str(error)) from error
             raise
 
-    def check_frame(self, camera: object) -> None:
-        """Prove the stream is delivering frames, without saving a test image."""
+    def check_startup_frame(self, camera: object) -> None:
+        """Validate one frame at initialization, never take periodic probes."""
         request = self.request_frame(camera)
         try:
             request.get_metadata()
         finally:
             request.release()
-        self.health_checked.emit()
+        self.startup_probe_succeeded.emit()
 
     @staticmethod
     def manual_controls(settings: Dict[str, object]) -> Dict[str, object]:
@@ -464,7 +461,7 @@ def run_camera_child(connection: object, config: Dict[str, object]) -> None:
         "auto_calibration_succeeded", "auto_calibration_failed",
         "capture_started", "frame_acquired", "inspection_status_changed",
         "inspection_completed", "inspection_failed", "succeeded", "failed",
-        "camera_fault", "health_checked", "stopped",
+        "camera_fault", "startup_probe_succeeded", "stopped",
     )
     for name in signal_names:
         getattr(worker, name).connect(
@@ -482,6 +479,8 @@ class ProcessCaptureWorker(CaptureWorker):
 
     def __init__(self, initial_camera_settings=None, model_root=None) -> None:
         super().__init__(initial_camera_settings=initial_camera_settings)
+        from camera_recovery import WakeableQueue
+        self.commands = WakeableQueue()
         self.model_root = model_root
 
     @QtCore.pyqtSlot()

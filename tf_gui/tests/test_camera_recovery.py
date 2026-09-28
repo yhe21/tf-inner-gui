@@ -3,8 +3,8 @@
 from collections import deque
 from dataclasses import replace
 import json
+from multiprocessing.connection import wait
 from pathlib import Path
-import queue
 import sys
 import tempfile
 import time
@@ -16,12 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from camera_recovery import (  # noqa: E402
     CameraProcessSupervisor,
     RecoveryLimits,
+    WakeableQueue,
     request_pi_reboot,
 )
 
 
 READY = ("ready", (4056, 3040, True))
-PROBE_OK = ("health_checked", ())
+PROBE_OK = ("startup_probe_succeeded", ())
 ABSENT = ("initialization_failed", ("camera absent",))
 FAULT = ("camera_fault", ("no frame",))
 CAPTURE = ("capture", Path("image.jpg"), True, "INNER", False)
@@ -29,8 +30,8 @@ CALIBRATE = ("auto_calibrate", None, False, None, False)
 FAST = RecoveryLimits(
     startup_timeout=0.015, capture_timeout=0.008,
     processing_timeout=0.03, calibration_timeout=0.015,
-    health_interval=1.0, retry_delay=0.001, initial_retry_delay=0.001,
-    shutdown_timeout=0.002, poll_interval=0.001,
+    retry_delay=0.001, initial_retry_delay=0.001,
+    shutdown_timeout=0.002,
 )
 
 
@@ -139,11 +140,14 @@ class FakeContext:
 
 
 class SupervisorTests(unittest.TestCase):
-    def run_supervisor(self, plans, on_event=None, limits=FAST, settings=None):
-        commands = queue.Queue()
+    def run_supervisor(self, plans, on_event=None, limits=FAST, settings=None,
+                       on_wait=None):
+        commands = WakeableQueue()
+        self.addCleanup(commands.close)
         events = []
         reboots = []
         context = FakeContext(plans)
+        wait_errors = []
 
         def emit(name, args):
             events.append((name, args))
@@ -154,7 +158,34 @@ class SupervisorTests(unittest.TestCase):
             commands, emit, settings, "/models", _unused_target,
             limits=limits, reboot=lambda: reboots.append(True), context=context,
         )
-        supervisor.run()
+
+        def wait_for_activity(timeout, child=True):
+            # Only the process/connection is scripted; command notification uses
+            # the real waitable queue. No periodic sleep drives this supervisor.
+            if on_wait is not None:
+                try:
+                    on_wait(timeout, supervisor, context)
+                except AssertionError as error:
+                    wait_errors.append(error)
+                    supervisor._stopping = True
+                    return
+            connection = supervisor._connection
+            process = supervisor._process
+            if child and ((connection is not None and connection.events)
+                          or (process is not None and not process.alive)):
+                return
+            if timeout is None and commands.empty():
+                wait_errors.append(AssertionError(
+                    "Scripted idle wait needs a command or event"
+                ))
+                supervisor._stopping = True
+                return
+            wait([commands.reader], timeout)
+
+        with mock.patch.object(supervisor, "_wait_for_activity", wait_for_activity):
+            supervisor.run()
+        if wait_errors:
+            raise wait_errors[0]
         return supervisor, events, reboots, context
 
     def test_initial_absence_retries_without_reboot(self):
@@ -287,22 +318,44 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual([command for command in context.processes[0].sent if command], [CAPTURE])
         self.assertEqual([command for command in context.processes[1].sent if command], [])
 
-    def test_idle_health_timeout_is_a_runtime_camera_outage(self):
-        ready_count = []
+    def test_ready_idle_camera_waits_indefinitely_without_acquiring_frames(self):
+        waits = []
+
+        def on_wait(timeout, supervisor, context):
+            waits.append(timeout)
+            self.assertTrue(supervisor._child_ready)
+            self.assertIsNone(timeout)
+            self.assertEqual(context.processes[0].sent, [])
+            supervisor.commands.put(None)
+
+        _, _, reboots, context = self.run_supervisor(
+            [{"initial": [PROBE_OK, READY]}], on_wait=on_wait,
+        )
+        self.assertEqual(waits, [None])
+        self.assertEqual([command for command in context.processes[0].sent
+                          if command is not None], [])
+        self.assertEqual(len(context.processes), 1)
+        self.assertEqual(reboots, [])
+
+    def test_already_arrived_capture_is_dispatched_before_first_wait(self):
+        waits = []
 
         def emit(name, _args, commands, _context):
             if name == "ready":
-                ready_count.append(True)
-                if len(ready_count) == 2:
-                    commands.put(None)
+                commands.put(CAPTURE)
 
-        _, _, reboots, context = self.run_supervisor(
-            [{"initial": [READY]}, {"initial": [READY]}], emit,
-            limits=replace(FAST, health_interval=0.002),
+        def on_wait(timeout, supervisor, context):
+            waits.append(timeout)
+            self.assertEqual(context.processes[0].sent, [CAPTURE])
+            self.assertIsNotNone(timeout)
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, FAST.capture_timeout + 1e-6)
+            supervisor.commands.put(None)
+
+        _, _, _, _ = self.run_supervisor(
+            [{"initial": [READY]}], emit, on_wait=on_wait,
         )
-        self.assertEqual(context.processes[0].sent[0][0], "health_check")
-        self.assertEqual(len(context.processes), 2)
-        self.assertEqual(reboots, [])
+        self.assertEqual(len(waits), 1)
 
     def test_successful_camera_probe_prevents_reboot_for_repeated_ai_startup_hangs(self):
         startup_failures = []
@@ -384,7 +437,8 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(context.processes), 1)
 
     def test_real_spawned_hung_child_is_reaped_without_hardware(self):
-        commands = queue.Queue()
+        commands = WakeableQueue()
+        self.addCleanup(commands.close)
         events = []
         reboots = []
 

@@ -301,7 +301,7 @@ class CameraStartupProbeTests(unittest.TestCase):
                     initial_camera_settings=settings, validate_startup=True,
                 )
                 worker.ready.connect(lambda *args: events.append(("ready", args)))
-                worker.health_checked.connect(lambda: events.append("healthy"))
+                worker.startup_probe_succeeded.connect(lambda: events.append("startup_probe"))
                 worker.stop()
                 worker.run()
 
@@ -309,8 +309,8 @@ class CameraStartupProbeTests(unittest.TestCase):
                 self.assertEqual(events.count(("acquire", True)), 1)
                 self.assertLess(events.index("start"), events.index(("acquire", True)))
                 self.assertLess(events.index("metadata"), events.index("release"))
-                self.assertLess(events.index("release"), events.index("healthy"))
-                self.assertLess(events.index("healthy"), events.index(expected_ready))
+                self.assertLess(events.index("release"), events.index("startup_probe"))
+                self.assertLess(events.index("startup_probe"), events.index(expected_ready))
                 self.assertEqual(events[-2:], ["stop", "close"])
 
     def test_startup_probe_failure_never_marks_camera_ready_and_releases_acquired_frame(self):
@@ -403,7 +403,7 @@ class SpawnedCameraIntegrationTests(unittest.TestCase):
             try:
                 startup_events = self.receive_until(parent_pipe, "ready")
                 self.assertEqual(startup_events, [
-                    ("health_checked", ()), ("ready", (4056, 3040, True)),
+                    ("startup_probe_succeeded", ()), ("ready", (4056, 3040, True)),
                 ])
                 parent_pipe.send(("capture", output_path, True, "INNER", True))
                 capture_events = self.receive_until(parent_pipe, "succeeded")
