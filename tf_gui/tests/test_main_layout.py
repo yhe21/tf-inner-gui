@@ -101,10 +101,49 @@ class MainLayoutTests(unittest.TestCase):
                 self.assertTrue(controller.ready)
 
                 controller.on_initialization_failed("Camera unavailable")
-                self.assertEqual(window.lblCameraStatus.text(), "● Camera error: Camera unavailable")
+                self.assertEqual(window.lblCameraStatus.text(), "● Camera offline")
                 self.assertFalse(window.lblCameraStatus.property("statusOk"))
                 window.update_camera_status("Camera starting...", False)
                 self.assertEqual(window.lblCameraStatus.text(), "● Camera starting...")
+            finally:
+                dialog.close()
+                window.close()
+
+    def test_camera_recovery_header_fits_and_preserves_detailed_status(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CameraController, "start"):
+            root = Path(directory)
+            window = MainWindow(
+                store=AdjustmentStore(root / "adjustments.json"),
+                capture_settings_store=CaptureSettingsStore(root / "capture.json"),
+                camera_settings_store=CameraSettingsStore(root / "camera.json"),
+                tcp_enabled=False,
+            )
+            controller = window.camera_controller
+            dialog = CameraMonitorDialog(controller, window)
+            statuses = (
+                ("Camera unavailable: Camera frame acquisition timed out", "Camera offline"),
+                ("Reconnecting camera (10/10)...", "Retry 10/10"),
+                ("Camera unavailable after 10 recovery attempts; requesting Raspberry Pi restart...", "Restart soon"),
+                ("Automatic restart failed: Camera reboot blocked: another automatic reboot was requested within the last 30 minutes", "Restart blocked"),
+                ("Automatic restart failed: sudo: a password is required", "Restart failed"),
+                ("Raspberry Pi reboot requested after camera recovery failed", "Restarting Pi"),
+            )
+            try:
+                window.resize(1024, 600)
+                window.show()
+                window.update_vt6_status("VT6 waiting on port 5000", False)
+                for detailed, compact in statuses:
+                    with self.subTest(status=compact):
+                        controller.on_camera_unavailable(detailed)
+                        self.app.processEvents()
+                        self.assertEqual(window.size(), QtCore.QSize(1024, 600))
+                        self.assertEqual(window.lblCameraStatus.text(), f"● {compact}")
+                        self.assertEqual(window.lblCameraStatus.toolTip(), detailed)
+                        self.assertEqual(dialog.lblCameraPageStatus.text(), detailed)
+                        self.assertFalse(window.lblCameraStatus.property("statusOk"))
+                        self.assertGreaterEqual(window.lblCameraStatus.width(),
+                                                window.lblCameraStatus.sizeHint().width())
             finally:
                 dialog.close()
                 window.close()

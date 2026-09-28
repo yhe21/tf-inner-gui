@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import math
 import queue
 import sys
@@ -8,6 +9,8 @@ from collections import deque
 from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime
+from functools import partial
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Deque, Dict, Optional, Tuple
 
@@ -41,7 +44,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.5"
+APP_VERSION = "0.4.6"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -132,8 +135,12 @@ def save_rotated_jpeg(rotated_image: object, output_path: Path) -> None:
     rotated_image.save(output_path, format="JPEG", quality=95)
 
 
+class CameraAcquisitionError(RuntimeError):
+    """A camera request failed; the process supervisor owns recovery."""
+
+
 class CaptureWorker(QtCore.QObject):
-    """Own one continuously running Picamera2 instance in a worker thread."""
+    """Own one continuously running Picamera2 instance in the camera process."""
 
     ready = QtCore.pyqtSignal(int, int, bool)
     initialization_failed = QtCore.pyqtSignal(str)
@@ -148,6 +155,9 @@ class CaptureWorker(QtCore.QObject):
     succeeded = QtCore.pyqtSignal(str, bool)
     failed = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
+    camera_fault = QtCore.pyqtSignal(str)
+    health_checked = QtCore.pyqtSignal()
+    unavailable = QtCore.pyqtSignal(str)
 
     def __init__(
         self,
@@ -158,6 +168,8 @@ class CaptureWorker(QtCore.QObject):
         auto_calibration_seconds: float = 2.0,
         manual_settle_seconds: float = 0.5,
         inspection_engine_factory: Optional[Callable[[], object]] = None,
+        validate_startup: bool = False,
+        report_camera_faults: bool = False,
     ) -> None:
         super().__init__()
         self.camera_factory = camera_factory
@@ -167,6 +179,8 @@ class CaptureWorker(QtCore.QObject):
         self.auto_calibration_seconds = auto_calibration_seconds
         self.manual_settle_seconds = manual_settle_seconds
         self.inspection_engine_factory = inspection_engine_factory
+        self.validate_startup = validate_startup
+        self.report_camera_faults = report_camera_faults
         self.commands: "queue.Queue[Optional[CaptureCommand]]" = queue.Queue()
 
     def request_capture(
@@ -216,6 +230,8 @@ class CaptureWorker(QtCore.QObject):
             # A saved manual configuration is active before the first frame.
             # Without one, AE/AWB may run only so the operator can calibrate.
             time.sleep(self.warmup_seconds)
+            if self.validate_startup:
+                self.check_frame(camera)
 
             if self.inspection_engine_factory is not None:
                 self.inspection_status_changed.emit("AI models loading...", False)
@@ -248,6 +264,9 @@ class CaptureWorker(QtCore.QObject):
                     inspection_kind,
                     bypass_inspection,
                 ) = command
+                if command_name == "health_check":
+                    self.check_frame(camera)
+                    continue
                 if command_name == "auto_calibrate":
                     self.auto_calibrate(camera)
                     continue
@@ -274,6 +293,24 @@ class CaptureWorker(QtCore.QObject):
                     camera.close()
             self.stopped.emit()
 
+    def request_frame(self, camera: object) -> object:
+        try:
+            return camera.capture_request(flush=True)
+        except Exception as error:
+            if self.report_camera_faults:
+                self.camera_fault.emit(str(error))
+                raise CameraAcquisitionError(str(error)) from error
+            raise
+
+    def check_frame(self, camera: object) -> None:
+        """Prove the stream is delivering frames, without saving a test image."""
+        request = self.request_frame(camera)
+        try:
+            request.get_metadata()
+        finally:
+            request.release()
+        self.health_checked.emit()
+
     @staticmethod
     def manual_controls(settings: Dict[str, object]) -> Dict[str, object]:
         colour_gains = settings["colour_gains"]
@@ -291,7 +328,7 @@ class CaptureWorker(QtCore.QObject):
         try:
             camera.set_controls({"AeEnable": True, "AwbEnable": True})
             time.sleep(self.auto_calibration_seconds)
-            request = camera.capture_request(flush=True)
+            request = self.request_frame(camera)
             metadata = request.get_metadata()
             colour_gains = metadata.get("ColourGains")
             if not isinstance(colour_gains, (list, tuple)) or len(colour_gains) != 2:
@@ -313,6 +350,10 @@ class CaptureWorker(QtCore.QObject):
             time.sleep(self.manual_settle_seconds)
             self.camera_settings = settings
             self.auto_calibration_succeeded.emit(deepcopy(settings))
+        except CameraAcquisitionError:
+            # The supervisor will discard this camera process and restore the
+            # last saved manual settings; do not emit a second completion.
+            pass
         except Exception as error:
             self.camera_settings = None
             self.auto_calibration_failed.emit(str(error))
@@ -338,7 +379,7 @@ class CaptureWorker(QtCore.QObject):
                 output_path.parent.mkdir(parents=True, exist_ok=True)
 
             # flush=True guarantees that exposure starts no earlier than trigger time.
-            request = camera.capture_request(flush=True)
+            request = self.request_frame(camera)
             metadata = request.get_metadata()
             sensor_timestamp = int(metadata.get("SensorTimestamp", 0))
             self.frame_acquired.emit(
@@ -380,12 +421,112 @@ class CaptureWorker(QtCore.QObject):
                 self.image_saver(request, output_path)
                 image_was_saved = True
             self.succeeded.emit(str(output_path), image_was_saved)
+        except CameraAcquisitionError:
+            pass
         except Exception as error:
             self.failed.emit(str(error))
         finally:
             if request is not None:
                 with suppress(Exception):
                     request.release()
+
+
+class PipeCommands:
+    """Child-only command source. Blocking native calls stay in this process."""
+
+    def __init__(self, connection: object) -> None:
+        self.connection = connection
+
+    def get(self) -> Optional[CaptureCommand]:
+        try:
+            return self.connection.recv()
+        except EOFError:
+            return None
+
+
+def run_camera_child(connection: object, config: Dict[str, object]) -> None:
+    """Spawn entry point: only this process owns Picamera2 and AI models."""
+    model_root = config.get("model_root")
+    worker = CaptureWorker(
+        initial_camera_settings=config.get("settings"),
+        inspection_engine_factory=(
+            partial(FixedRoiClassifier, model_root=Path(model_root))
+            if model_root is not None else None
+        ),
+        validate_startup=True,
+        report_camera_faults=True,
+    )
+    worker.commands = PipeCommands(connection)
+    signal_names = (
+        "ready", "initialization_failed", "auto_calibration_started",
+        "auto_calibration_succeeded", "auto_calibration_failed",
+        "capture_started", "frame_acquired", "inspection_status_changed",
+        "inspection_completed", "inspection_failed", "succeeded", "failed",
+        "camera_fault", "health_checked", "stopped",
+    )
+    for name in signal_names:
+        getattr(worker, name).connect(
+            lambda *args, event=name: connection.send((event, args)),
+            type=QtCore.Qt.DirectConnection,
+        )
+    try:
+        worker.run()
+    finally:
+        connection.close()
+
+
+class ProcessCaptureWorker(CaptureWorker):
+    """Supervise a replaceable camera process from the existing worker thread."""
+
+    def __init__(self, initial_camera_settings=None, model_root=None) -> None:
+        super().__init__(initial_camera_settings=initial_camera_settings)
+        self.model_root = model_root
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        from camera_recovery import CameraProcessSupervisor
+
+        logger = logging.getLogger("tf_inner.camera_recovery")
+        if not logger.handlers:
+            try:
+                state_dir = Path.home() / ".local" / "state" / "tf_inner"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                handler = RotatingFileHandler(
+                    state_dir / "camera_recovery.log", maxBytes=1024 * 1024,
+                    backupCount=2, encoding="utf-8",
+                )
+            except OSError as error:
+                # A full or read-only disk must not disable camera supervision.
+                handler = logging.StreamHandler()
+                print(f"Camera recovery log unavailable: {error}", flush=True)
+            handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+
+        def forward(name, args):
+            if name == "stopped":
+                return
+            if name in {"unavailable", "ready", "auto_calibration_failed"}:
+                logger.info("%s %s", name, args)
+                print(f"Camera recovery: {name} {args}", flush=True)
+            if name == "auto_calibration_succeeded":
+                self.camera_settings = deepcopy(args[0])
+            getattr(self, name).emit(*args)
+
+        try:
+            supervisor = CameraProcessSupervisor(
+                commands=self.commands, emit=forward,
+                settings=deepcopy(self.camera_settings),
+                model_root=str(self.model_root) if self.model_root is not None else None,
+                target=run_camera_child,
+            )
+            supervisor.run()
+        except Exception as error:
+            logger.exception("Camera supervisor stopped unexpectedly")
+            self.unavailable.emit(f"Camera supervisor error: {error}")
+        finally:
+            self.stopped.emit()
 
 
 class CameraController(QtCore.QObject):
@@ -410,20 +551,28 @@ class CameraController(QtCore.QObject):
         worker_factory: Optional[Callable[[], CaptureWorker]] = None,
         initial_camera_settings: Optional[Dict[str, object]] = None,
         inspection_engine_factory: Optional[Callable[[], object]] = None,
+        model_root: Optional[Path] = None,
     ) -> None:
         super().__init__(parent)
         self.camera_settings = deepcopy(initial_camera_settings)
-        self.worker_factory = worker_factory or (
-            lambda: CaptureWorker(
+        if worker_factory is not None:
+            self.worker_factory = worker_factory
+        elif model_root is not None:
+            self.worker_factory = lambda: ProcessCaptureWorker(
+                initial_camera_settings=deepcopy(self.camera_settings),
+                model_root=model_root,
+            )
+        else:
+            self.worker_factory = lambda: CaptureWorker(
                 initial_camera_settings=deepcopy(self.camera_settings),
                 inspection_engine_factory=inspection_engine_factory,
             )
-        )
         self.thread: Optional[QtCore.QThread] = None
         self.worker: Optional[CaptureWorker] = None
         self.camera_available = False
         self.ready = False
         self.busy = False
+        self.recovering = False
         self.status_text = "Camera starting..."
         self.inspection_status_text = "AI models not loaded"
         self.inspection_ready = False
@@ -445,6 +594,7 @@ class CameraController(QtCore.QObject):
         self.thread.started.connect(self.worker.run)
         self.worker.ready.connect(self.on_ready)
         self.worker.initialization_failed.connect(self.on_initialization_failed)
+        self.worker.unavailable.connect(self.on_camera_unavailable)
         self.worker.auto_calibration_started.connect(
             self.on_auto_calibration_started
         )
@@ -511,6 +661,7 @@ class CameraController(QtCore.QObject):
 
     @QtCore.pyqtSlot(int, int, bool)
     def on_ready(self, width: int, height: int, settings_locked: bool) -> None:
+        self.recovering = False
         self.camera_available = True
         self.ready = settings_locked
         if settings_locked:
@@ -531,6 +682,20 @@ class CameraController(QtCore.QObject):
         self.status_text = f"Camera error: {error_message}"
         self.status_changed.emit(self.status_text, False)
 
+    @QtCore.pyqtSlot(str)
+    def on_camera_unavailable(self, message: str) -> None:
+        self.recovering = True
+        self.camera_available = False
+        self.ready = False
+        self.busy = False
+        self.inspection_ready = False
+        self.status_text = message
+        self.inspection_status_text = "AI paused - camera unavailable"
+        self.inspection_status_changed.emit(self.inspection_status_text, False)
+        # Mark not-ready before failing the active operation. The server must
+        # retire old queued robot triggers before any new camera is started.
+        self.status_changed.emit(message, False)
+
     @QtCore.pyqtSlot()
     def on_auto_calibration_started(self) -> None:
         self.auto_calibration_started.emit()
@@ -550,6 +715,10 @@ class CameraController(QtCore.QObject):
 
     @QtCore.pyqtSlot(str)
     def on_auto_calibration_failed(self, error_message: str) -> None:
+        if self.recovering:
+            self.busy = False
+            self.auto_calibration_failed.emit(error_message)
+            return
         self.camera_settings = None
         self.ready = False
         self.busy = False
@@ -817,6 +986,15 @@ class Vt6TrainingServer(QtCore.QObject):
     def camera_status_changed(self, _status_text: str, is_ready: bool) -> None:
         if is_ready:
             self.start_next_capture()
+        else:
+            # The robot does not wait for a camera recovery. Old triggers no
+            # longer describe the current workpiece and must not be replayed.
+            while self.capture_queue:
+                command, path, error_code, session, _save, _bypass = self.capture_queue.popleft()
+                if command is not None:
+                    self.send_response(f"{command},OK", session)
+                elif error_code is not None:
+                    self.append_error_log(error_code, path, "CAMERA_NOT_READY")
 
     @QtCore.pyqtSlot(str, bool)
     def capture_succeeded(self, path_text: str, _saved: bool) -> None:
@@ -1142,6 +1320,10 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
     @QtCore.pyqtSlot(str)
     def auto_calibration_failed(self, error_message: str) -> None:
+        if self.camera_controller.recovering:
+            self.lblCameraPageStatus.setText(self.camera_controller.status_text)
+            self.refresh_buttons()
+            return
         self.lblCameraPageStatus.setText(
             "Calibration failed. Production triggers remain disabled."
         )
@@ -1165,6 +1347,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
     @QtCore.pyqtSlot(str, bool)
     def capture_succeeded(self, path_text: str, saved: bool) -> None:
+        self.refresh_buttons()
         if not saved:
             self.lblCameraPageStatus.setText(
                 "Production frame captured; no review image was required."
@@ -1179,6 +1362,10 @@ class CameraMonitorDialog(QtWidgets.QDialog):
 
     @QtCore.pyqtSlot(str)
     def capture_failed(self, error_message: str) -> None:
+        if self.camera_controller.recovering:
+            self.lblCameraPageStatus.setText(self.camera_controller.status_text)
+            self.refresh_buttons()
+            return
         self.lblCameraPageStatus.setText(
             "Capture failed. Check the camera connection."
         )
@@ -1197,7 +1384,7 @@ class CameraMonitorDialog(QtWidgets.QDialog):
             self.camera_controller.camera_available
             and not self.camera_controller.busy
         )
-        self.btnCameraBack.setEnabled(not self.camera_controller.busy)
+        self.btnCameraBack.setEnabled(True)
         self.chkSaveProductionImages.setEnabled(
             not self.camera_controller.busy
         )
@@ -1271,28 +1458,6 @@ class CameraMonitorDialog(QtWidgets.QDialog):
     def done(self, result: int) -> None:
         self.disconnect_controller()
         super().done(result)
-
-    def reject(self) -> None:
-        if self.capture_is_running():
-            QtWidgets.QMessageBox.information(
-                self,
-                "Capture in Progress",
-                "Wait for the current capture to finish before going back.",
-            )
-            return
-        super().reject()
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if self.capture_is_running():
-            event.ignore()
-            QtWidgets.QMessageBox.information(
-                self,
-                "Capture in Progress",
-                "Wait for the current capture to finish before closing.",
-            )
-            return
-        super().closeEvent(event)
-
 
 def normalize_value(value: object) -> float:
     """Clamp a saved or edited value to the supported 0.05-unit grid."""
@@ -1590,9 +1755,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.camera_controller = CameraController(
             self,
             initial_camera_settings=self.camera_settings,
-            inspection_engine_factory=(
-                lambda: FixedRoiClassifier(model_root=model_root)
-            ),
+            model_root=model_root,
         )
         self.camera_controller.status_changed.connect(self.update_camera_status)
         self.camera_controller.camera_settings_changed.connect(
@@ -1633,6 +1796,24 @@ class MainWindow(QtWidgets.QMainWindow):
         display_text = status_text
         if status_text.startswith("Camera ready"):
             display_text = "Camera ready" if is_ready else "Not calibrated"
+        elif status_text.startswith("Reconnecting camera ("):
+            attempt = status_text.partition("(")[2].partition(")")[0]
+            display_text = f"Retry {attempt}"
+        elif status_text.startswith("Camera unavailable after"):
+            display_text = "Restart soon"
+        elif status_text.startswith("Automatic restart failed:"):
+            display_text = "Restart blocked" if "blocked" in status_text else "Restart failed"
+        elif status_text.startswith(("Raspberry Pi reboot requested", "Raspberry Pi restart requested")):
+            display_text = "Restarting Pi"
+        elif status_text.startswith((
+            "Camera unavailable:", "Camera error:", "Camera process ",
+            "Camera supervisor error:",
+        )):
+            display_text = "Camera offline"
+        elif status_text.startswith("Auto exposure and white balance"):
+            display_text = "Calibrating..."
+        elif status_text.startswith("Exposure calibration failed:"):
+            display_text = "Calib. failed"
         self.lblCameraStatus.setText(f"● {display_text}")
         self.lblCameraStatus.setToolTip(status_text)
         self.lblCameraStatus.setProperty("statusOk", is_ready)
