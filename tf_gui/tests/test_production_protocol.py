@@ -1,4 +1,4 @@
-"""Production verdict and NG debounce checks without cameras or robot sockets."""
+"""Single-result production verdict checks without cameras or robot sockets."""
 
 import os
 import sys
@@ -92,11 +92,6 @@ class ProductionProtocolTests(unittest.TestCase):
         self.controller.on_inspection_completed(verdict(command, label, bypassed))
         self.controller.on_capture_succeeded(str(output_path), False)
 
-    def two_glue_ngs(self):
-        self.complete("GLUE")
-        self.complete("GLUE")
-        self.assertEqual(self.server.glue_ng_streak, 2)
-
     def replace_client(self):
         new_client = BufferedClient()
         listener = mock.Mock()
@@ -126,25 +121,19 @@ class ProductionProtocolTests(unittest.TestCase):
         self.controller.on_capture_succeeded(str(output_path), False)
         self.assertEqual(self.client.writes, ["INNER,OK"])
 
-    def test_glue_third_and_later_consecutive_ng_replies_ng(self):
+    def test_glue_first_and_every_subsequent_ng_replies_ng(self):
         for _ in range(5):
             self.complete("GLUE")
-        self.assertEqual(self.client.writes, [
-            "GLUE,OK", "GLUE,OK", "GLUE,NG", "GLUE,NG", "GLUE,NG",
-        ])
-        self.assertEqual(self.server.glue_ng_streak, 3)
+        self.assertEqual(self.client.writes, ["GLUE,NG"] * 5)
 
-    def test_glue_ok_breaks_consecutive_ng_sequence(self):
-        self.two_glue_ngs()
-        self.complete("GLUE", "OK")
-        self.assertEqual(self.server.glue_ng_streak, 0)
-        self.two_glue_ngs()
-        self.assertEqual(self.client.writes, ["GLUE,OK"] * 5)
+    def test_glue_verdict_depends_only_on_current_valid_result(self):
+        labels = ["NG", "OK", "NG", "OK", "OK", "NG"]
+        for label in labels:
+            self.complete("GLUE", label)
+        self.assertEqual(self.client.writes, [f"GLUE,{label}" for label in labels])
+
+    def test_unrelated_work_and_manual_results_do_not_change_glue_verdict(self):
         self.complete("GLUE")
-        self.assertEqual(self.client.writes[-1], "GLUE,NG")
-
-    def test_unrelated_work_does_not_break_or_advance_glue_sequence(self):
-        self.two_glue_ngs()
         self.complete("INNER", "OK")
         self.complete("INNER", "NG")
         np_path = self.start_capture("NP")
@@ -153,142 +142,165 @@ class ProductionProtocolTests(unittest.TestCase):
         self.server.handle_command("NO_GLUE", response_session=7)
         fault_path = self.server.active_capture[1]
         self.controller.on_capture_succeeded(str(fault_path), True)
-        # Results from manual captures never participate in robot debounce.
+        before = list(self.client.writes)
+        # Manual captures must not produce an unsolicited robot reply.
         self.controller.on_inspection_completed(verdict("GLUE", "OK"))
         self.controller.on_inspection_completed(verdict("GLUE", "NG"))
-        self.assertEqual(self.server.glue_ng_streak, 2)
+        self.assertEqual(self.client.writes, before)
         self.complete("GLUE")
         self.assertEqual(self.client.writes[-1], "GLUE,NG")
         self.assertNotIn("NO_GLUE,OK", self.client.writes)
 
-    def test_missing_result_uses_ok_not_cached_ng_and_clears_glue_sequence(self):
-        self.two_glue_ngs()
+    def test_missing_result_uses_ok_not_cached_ng(self):
+        self.complete("GLUE")
         output_path = self.start_capture("GLUE")
         self.controller.latest_inspection_results["GLUE"] = verdict("GLUE")
         self.controller.on_capture_succeeded(str(output_path), True)
         self.assertEqual(self.client.writes[-1], "GLUE,OK")
-        self.assertEqual(self.server.glue_ng_streak, 0)
         self.complete("GLUE")
-        self.assertEqual(self.client.writes[-1], "GLUE,OK")
-        self.assertEqual(self.server.glue_ng_streak, 1)
+        self.assertEqual(self.client.writes, ["GLUE,NG", "GLUE,OK", "GLUE,NG"])
 
-    def test_model_failure_uses_ok_and_clears_glue_sequence(self):
-        self.two_glue_ngs()
+    def test_model_failure_uses_ok_without_suppressing_next_valid_ng(self):
+        self.complete("GLUE")
         output_path = self.start_capture("GLUE")
         self.controller.on_inspection_failed("GLUE", "Model execution failed")
         self.controller.on_capture_succeeded(str(output_path), True)
         self.assertEqual(self.client.writes[-1], "GLUE,OK")
-        self.assertEqual(self.server.glue_ng_streak, 0)
+        self.complete("GLUE")
+        self.assertEqual(self.client.writes, ["GLUE,NG", "GLUE,OK", "GLUE,NG"])
 
-    def test_capture_failure_uses_ok_and_clears_glue_sequence(self):
-        self.two_glue_ngs()
+    def test_capture_failure_uses_ok_exactly_once(self):
+        self.complete("GLUE")
         self.start_capture("GLUE")
         self.controller.on_capture_failed("Camera timed out")
         self.controller.on_capture_failed("Duplicate completion")
-        self.assertEqual(self.client.writes, ["GLUE,OK"] * 3)
-        self.assertEqual(self.server.glue_ng_streak, 0)
+        self.assertEqual(self.client.writes, ["GLUE,NG", "GLUE,OK"])
 
     def test_valid_ng_is_not_overwritten_by_later_image_save_failure(self):
-        self.two_glue_ngs()
         self.start_capture("GLUE")
         self.controller.on_inspection_completed(verdict("GLUE"))
+        self.assertEqual(self.client.writes, ["GLUE,NG"])
         self.controller.on_capture_failed("Disk full while writing JPEG")
-        self.assertEqual(self.client.writes, ["GLUE,OK", "GLUE,OK", "GLUE,NG"])
-        self.assertEqual(self.server.glue_ng_streak, 3)
+        self.assertEqual(self.client.writes, ["GLUE,NG"])
         self.assertIsNone(self.server.active_capture)
 
-    def test_inner_failure_resets_glue_sequence_as_unavailable_inspection(self):
-        self.two_glue_ngs()
+    def test_inner_failure_uses_ok_without_suppressing_next_glue_ng(self):
+        self.complete("GLUE")
         self.start_capture("INNER")
         self.controller.on_capture_failed("INNER model failure")
         self.assertEqual(self.client.writes[-1], "INNER,OK")
-        self.assertEqual(self.server.glue_ng_streak, 0)
+        self.complete("GLUE")
+        self.assertEqual(self.client.writes, ["GLUE,NG", "INNER,OK", "GLUE,NG"])
 
-    def test_wrong_command_and_invalid_label_do_not_use_stale_or_counted_ng(self):
-        self.two_glue_ngs()
+    def test_wrong_command_and_invalid_label_do_not_send_ng(self):
         output_path = self.start_capture("GLUE")
         self.controller.on_inspection_completed(verdict("INNER"))
         self.controller.on_inspection_completed(verdict("GLUE", "ERROR"))
-        self.controller.on_capture_succeeded(str(output_path), False)
-        self.assertEqual(self.client.writes, ["GLUE,OK"] * 3)
-        self.assertEqual(self.server.glue_ng_streak, 0)
-
-    def test_duplicate_glue_result_is_counted_only_once(self):
-        output_path = self.start_capture("GLUE")
-        self.controller.on_inspection_completed(verdict("GLUE"))
-        self.controller.on_inspection_completed(verdict("GLUE"))
-        self.controller.on_inspection_completed(verdict("GLUE"))
+        self.assertEqual(self.client.writes, [])
         self.controller.on_capture_succeeded(str(output_path), False)
         self.assertEqual(self.client.writes, ["GLUE,OK"])
-        self.assertEqual(self.server.glue_ng_streak, 1)
 
-    def test_bypass_request_forces_ok_and_resets_glue_sequence(self):
-        self.two_glue_ngs()
+    def test_glue_ng_replies_before_image_completion_and_exactly_once(self):
+        output_path = self.start_capture("GLUE")
+        self.controller.on_inspection_completed(verdict("GLUE"))
+        self.assertEqual(self.client.writes, ["GLUE,NG"])
+        self.assertIsNotNone(self.server.active_capture)
+        self.controller.on_inspection_completed(verdict("GLUE"))
+        self.controller.on_inspection_completed(verdict("GLUE", "OK"))
+        self.controller.on_capture_succeeded(str(output_path), False)
+        self.assertEqual(self.client.writes, ["GLUE,NG"])
+        self.assertIsNone(self.server.active_capture)
+
+    def test_repeated_glue_requests_receive_one_reply_per_capture(self):
+        first_path = self.start_capture("GLUE")
+        self.server.handle_command("GLUE", response_session=7)
+        self.assertEqual(len(self.server.capture_queue), 1)
+        self.assertEqual(self.server.active_capture[1], first_path)
+
+        self.controller.on_inspection_completed(verdict("GLUE"))
+        self.controller.on_inspection_completed(verdict("GLUE"))
+        self.assertEqual(self.client.writes, ["GLUE,NG"])
+        self.controller.on_capture_succeeded(str(first_path), False)
+
+        self.assertIsNotNone(self.server.active_capture)
+        second_path = self.server.active_capture[1]
+        self.assertNotEqual(first_path, second_path)
+        self.controller.on_inspection_completed(verdict("GLUE", "OK"))
+        self.controller.on_capture_succeeded(str(second_path), False)
+        self.assertEqual(self.client.writes, ["GLUE,NG", "GLUE,OK"])
+        self.assertIsNone(self.server.active_capture)
+
+    def test_bypass_request_forces_ok_for_both_inspections(self):
         self.bypass = True
         self.complete("GLUE", "NG")
         self.assertEqual(self.client.writes[-1], "GLUE,OK")
-        self.assertEqual(self.server.glue_ng_streak, 0)
         self.complete("INNER", "NG")
         self.assertEqual(self.client.writes[-1], "INNER,OK")
+        self.bypass = False
+        self.complete("GLUE", "NG")
+        self.assertEqual(self.client.writes[-1], "GLUE,NG")
 
-    def test_explicit_bypassed_result_resets_glue_sequence(self):
-        self.two_glue_ngs()
-        self.complete("GLUE", "OK", bypassed=True)
-        self.assertEqual(self.server.glue_ng_streak, 0)
-        self.assertEqual(self.client.writes[-1], "GLUE,OK")
+    def test_explicit_bypassed_result_forces_ok_for_both_inspections(self):
+        for command in ("GLUE", "INNER"):
+            self.complete(command, "NG", bypassed=True)
+        self.assertEqual(self.client.writes, ["GLUE,OK", "INNER,OK"])
 
-    def test_camera_unavailable_resets_glue_sequence_and_keeps_ok_fallback(self):
-        self.two_glue_ngs()
+    def test_camera_unavailable_keeps_ok_fallback_then_valid_ng_replies_ng(self):
         self.controller.on_camera_unavailable("Camera recovering")
-        self.assertEqual(self.server.glue_ng_streak, 0)
         self.server.handle_command("GLUE", response_session=7)
-        self.assertEqual(self.client.writes[-1], "GLUE,OK")
+        self.server.handle_command("INNER", response_session=7)
+        self.assertEqual(self.client.writes, ["GLUE,OK", "INNER,OK"])
+        self.controller.on_ready(4056, 3040, True)
+        self.complete("GLUE")
+        self.assertEqual(self.client.writes[-1], "GLUE,NG")
 
-    def test_new_connection_resets_sequence_and_ignores_old_active_result(self):
-        self.two_glue_ngs()
+    def test_new_connection_ignores_old_active_result_then_first_ng_replies_ng(self):
         old_path = self.start_capture("GLUE")
         new_client = self.replace_client()
-        self.assertEqual(self.server.glue_ng_streak, 0)
         self.controller.on_inspection_completed(verdict("GLUE"))
         self.controller.on_capture_succeeded(str(old_path), True)
         self.assertEqual(new_client.writes, [])
-        self.assertEqual(self.server.glue_ng_streak, 0)
+        self.assertEqual(self.client.writes, [])
         self.complete("GLUE")
-        self.assertEqual(new_client.writes, ["GLUE,OK"])
-        self.assertEqual(self.server.glue_ng_streak, 1)
+        self.assertEqual(new_client.writes, ["GLUE,NG"])
 
-    def test_old_session_failure_cannot_reset_new_session_sequence(self):
+    def test_old_session_failure_cannot_reply_to_new_session(self):
         self.start_capture("GLUE")
         new_client = self.replace_client()
-        self.server.glue_ng_streak = 2
         self.controller.on_capture_failed("Late failure from the retired session")
         self.assertEqual(new_client.writes, [])
-        self.assertEqual(self.server.glue_ng_streak, 2)
+        self.complete("GLUE")
+        self.assertEqual(new_client.writes, ["GLUE,NG"])
 
-    def test_current_disconnect_and_stop_reset_glue_sequence(self):
-        self.two_glue_ngs()
-        self.server.client_disconnected(self.client)
-        self.assertEqual(self.server.glue_ng_streak, 0)
-        self.server.current_client = BufferedClient()
-        self.server.current_session_id = 8
-        self.two_glue_ngs()
-        self.server.stop()
-        self.assertEqual(self.server.glue_ng_streak, 0)
+    def test_disconnect_or_stop_prevents_pending_result_reply(self):
+        for stop_server in (False, True):
+            with self.subTest(stop_server=stop_server):
+                self.server.current_client = self.client
+                self.server.current_session_id = 7
+                output_path = self.start_capture("GLUE")
+                if stop_server:
+                    self.server.stop()
+                else:
+                    self.server.client_disconnected(self.client)
+                self.controller.on_inspection_completed(verdict("GLUE"))
+                self.controller.on_capture_succeeded(str(output_path), True)
+                self.assertEqual(self.client.writes, [])
+                self.assertIsNone(self.server.current_client)
+                self.assertIsNone(self.server.current_session_id)
 
-    def test_retired_client_disconnect_does_not_reset_current_sequence(self):
-        self.two_glue_ngs()
+    def test_retired_client_disconnect_does_not_disconnect_current_client(self):
         self.server.client_disconnected(BufferedClient())
-        self.assertEqual(self.server.glue_ng_streak, 2)
+        self.assertIs(self.server.current_client, self.client)
+        self.assertEqual(self.server.current_session_id, 7)
+        self.complete("GLUE")
+        self.assertEqual(self.client.writes, ["GLUE,NG"])
 
     def test_fault_inspection_result_cannot_send_robot_verdict(self):
-        self.two_glue_ngs()
-        before = list(self.client.writes)
         self.server.handle_command("NO_GLUE", response_session=7)
         output_path = self.server.active_capture[1]
         self.controller.on_inspection_completed(verdict("GLUE"))
         self.controller.on_capture_succeeded(str(output_path), True)
-        self.assertEqual(self.client.writes, before)
-        self.assertEqual(self.server.glue_ng_streak, 2)
+        self.assertEqual(self.client.writes, [])
 
     def test_loopback_socket_receives_ng_while_capture_is_still_busy(self):
         # Bind only loopback on an OS-assigned port; never contact a robot.

@@ -44,8 +44,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.8"
-GLUE_NG_THRESHOLD = 3
+APP_VERSION = "0.4.9"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -799,7 +798,6 @@ class Vt6TrainingServer(QtCore.QObject):
         self.capture_queue: Deque[CaptureJob] = deque()
         self.active_capture: Optional[CaptureJob] = None
         self.active_response_handled = False
-        self.glue_ng_streak = 0
 
         self.server.newConnection.connect(self.accept_connection)
         self.camera_controller.status_changed.connect(self.camera_status_changed)
@@ -818,7 +816,6 @@ class Vt6TrainingServer(QtCore.QObject):
         return True
 
     def stop(self) -> None:
-        self.reset_glue_ng_streak()
         if self.current_client is not None:
             self.current_client.disconnectFromHost()
         for client in list(self.client_buffers):
@@ -843,7 +840,6 @@ class Vt6TrainingServer(QtCore.QObject):
             self.next_session_id += 1
             self.client_sessions[new_client] = session_id
             self.current_session_id = session_id
-            self.reset_glue_ng_streak()
             new_client.readyRead.connect(
                 lambda client=new_client: self.read_client(client)
             )
@@ -860,7 +856,6 @@ class Vt6TrainingServer(QtCore.QObject):
         self.client_buffers.pop(client, None)
         self.client_sessions.pop(client, None)
         if self.current_client is client:
-            self.reset_glue_ng_streak()
             self.current_client = None
             self.current_session_id = None
             if self.server.isListening():
@@ -994,7 +989,6 @@ class Vt6TrainingServer(QtCore.QObject):
         if is_ready:
             self.start_next_capture()
         else:
-            self.reset_glue_ng_streak()
             # The robot does not wait for a camera recovery. Old triggers no
             # longer describe the current workpiece and must not be replayed.
             while self.capture_queue:
@@ -1044,9 +1038,6 @@ class Vt6TrainingServer(QtCore.QObject):
             self.active_response_handled = False
         self.start_next_capture()
 
-    def reset_glue_ng_streak(self) -> None:
-        self.glue_ng_streak = 0
-
     @QtCore.pyqtSlot(object)
     def inspection_completed(self, result: InspectionResult) -> None:
         job = self.active_capture
@@ -1066,25 +1057,14 @@ class Vt6TrainingServer(QtCore.QObject):
         self, command: str, response_session: Optional[int],
         result: Optional[InspectionResult] = None, bypass: bool = False,
     ) -> None:
-        # A stale capture must not affect the new connection's GLUE counter.
+        # Never deliver an old capture result to a replacement connection.
         if not self.is_current_connection(response_session):
             return
         bypass = bypass or bool(self.inspection_bypass_provider()) or (
             result is not None and result.was_bypassed
         )
         valid_ng = result is not None and result.overall_label == "NG" and not bypass
-        if bypass or (command in {"INNER", "GLUE"} and result is None):
-            self.reset_glue_ng_streak()
-        verdict = "OK"
-        if command == "INNER" and valid_ng:
-            verdict = "NG"
-        elif command == "GLUE":
-            if valid_ng:
-                self.glue_ng_streak = min(GLUE_NG_THRESHOLD, self.glue_ng_streak + 1)
-                if self.glue_ng_streak >= GLUE_NG_THRESHOLD:
-                    verdict = "NG"
-            else:
-                self.reset_glue_ng_streak()
+        verdict = "NG" if command in {"INNER", "GLUE"} and valid_ng else "OK"
         response = f"{command},{verdict}"
         written = self.send_response(response, response_session)
         # Included in the existing redirected startup log for field diagnosis.
@@ -1093,7 +1073,7 @@ class Vt6TrainingServer(QtCore.QObject):
                 f"{datetime.now().isoformat(timespec='milliseconds')} Production reply: "
                 f"session={response_session} command={command} "
                 f"AI={result.overall_label if result is not None else 'UNAVAILABLE'} "
-                f"bypass={bypass} glue_ng={self.glue_ng_streak}/{GLUE_NG_THRESHOLD} "
+                f"bypass={bypass} "
                 f"reply={response} queued={written}", flush=True,
             )
 
@@ -1927,8 +1907,6 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bool)
     def set_inspection_bypass(self, enabled: bool) -> None:
         self.inspection_bypass = enabled
-        if enabled and self.vt6_server is not None:
-            self.vt6_server.reset_glue_ng_streak()
         try:
             self.capture_settings_store.save_bypass(enabled)
         except OSError as error:

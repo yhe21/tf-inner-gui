@@ -152,6 +152,46 @@ class InspectionTests(unittest.TestCase):
         self.assertNotIn("import torch", source)
         self.assertNotIn("import ultralytics", source)
 
+    def test_inner_and_glue_verdict_and_save_boundaries_on_either_side(self) -> None:
+        cases = (
+            ("OK", 0.8999, "NG", True),
+            ("OK", 0.90, "OK", True),
+            ("OK", 0.9499, "OK", True),
+            ("OK", 0.95, "OK", False),
+            # Confidence belongs to the predicted label: a confident NG
+            # still fails inspection and must be retained for review.
+            ("NG", 0.99, "NG", True),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for config in INSPECTION_CONFIG.values():
+                (root / config["model_dir"]).mkdir()
+            for command in ("INNER", "GLUE"):
+                for side in (0, 1):
+                    for label, score, verdict, save in cases:
+                        with self.subTest(command=command, side=side,
+                                          label=label, score=score):
+                            predictions = [("OK", 0.99), ("OK", 0.99)]
+                            predictions[side] = (label, score)
+                            model_name = INSPECTION_CONFIG[command]["model_dir"]
+                            models = {
+                                config["model_dir"]: FakeModel(
+                                    predictions if config["model_dir"] == model_name
+                                    else []
+                                )
+                                for config in INSPECTION_CONFIG.values()
+                            }
+                            engine = FixedRoiClassifier(
+                                root,
+                                model_factory=lambda path: models[path.name],
+                                warmup=False,
+                            )
+                            with mock.patch("inspection.crop_and_pad",
+                                            side_effect=["left", "right"]):
+                                result = engine.inspect(command, object())
+                            self.assertEqual(result.overall_label, verdict)
+                            self.assertEqual(requires_review_save(result), save)
+
     def test_missing_model_directory_fails_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             with self.assertRaisesRegex(FileNotFoundError, "INNER model not found"):
