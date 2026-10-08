@@ -16,6 +16,8 @@ from typing import Callable, Deque, Dict, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets, uic
 
+from error_notifications import ErrorNotificationManager
+
 from inspection import (
     DEFAULT_MODEL_ROOT,
     OK_CONFIDENCE_THRESHOLD,
@@ -44,7 +46,7 @@ CAMERA_BUFFER_COUNT = 4
 DEFAULT_TCP_PORT = 5000
 MAX_COMMAND_BYTES = 64
 MAX_CAPTURE_QUEUE = 100
-APP_VERSION = "0.4.9"
+APP_VERSION = "0.4.10"
 
 STATIONS = ("PickNP", "PickNPS", "DropNP")
 AXES = ("X", "Y", "Z", "U")
@@ -767,6 +769,7 @@ class Vt6TrainingServer(QtCore.QObject):
     """Non-blocking VT6 trigger, calibration, and fault-record protocol."""
 
     status_changed = QtCore.pyqtSignal(str, bool)
+    error_recorded = QtCore.pyqtSignal(str, bool)
 
     def __init__(
         self,
@@ -877,21 +880,21 @@ class Vt6TrainingServer(QtCore.QObject):
         while b"\n" in buffer:
             raw_line, remaining = buffer.split(b"\n", 1)
             buffer[:] = remaining
-            command = raw_line.rstrip(b"\r").decode("ascii", errors="ignore")
-            self.handle_command(
-                command.strip().upper(), self.client_sessions.get(client)
-            )
+            command = raw_line.rstrip(b"\r").decode("utf-8", errors="replace")
+            self.handle_command(command, self.client_sessions.get(client))
 
     def handle_command(
         self, command: str, response_session: Optional[int] = None
     ) -> None:
-        if not command:
+        normalized_command = command.strip().upper()
+        if not normalized_command:
             return
-        if command == "CALIB":
+        if normalized_command == "CALIB":
             self.send_response(self.format_calibration(), response_session)
-        elif command in PRODUCTION_COMMANDS:
-            self.enqueue_capture(command, response_session)
+        elif normalized_command in PRODUCTION_COMMANDS:
+            self.enqueue_capture(normalized_command, response_session)
         else:
+            # Error text is displayed as received, including unknown messages.
             self.enqueue_error_record(command)
 
     def format_calibration(self) -> str:
@@ -928,7 +931,10 @@ class Vt6TrainingServer(QtCore.QObject):
 
     def enqueue_error_record(self, error_code: str) -> None:
         output_path = build_error_capture_path(error_code, root=self.error_root)
-        self.append_error_log(error_code, output_path, "RECEIVED")
+        log_written = self.append_error_log(error_code, output_path, "RECEIVED")
+        # The log is closed before delivery. The UI receives this asynchronously;
+        # it neither waits for the fault photo nor acknowledges the robot.
+        self.error_recorded.emit(error_code, log_written)
 
         if not self.camera_controller.ready:
             self.append_error_log(error_code, output_path, "CAMERA_NOT_READY")
@@ -949,7 +955,7 @@ class Vt6TrainingServer(QtCore.QObject):
         error_code: str,
         output_path: Path,
         status: str,
-    ) -> None:
+    ) -> bool:
         recorded_at = datetime.now().isoformat(timespec="milliseconds")
         clean_code = error_code.replace("\t", " ").replace("\r", " ").replace("\n", " ")
         clean_status = status.replace("\t", " ").replace("\r", " ").replace("\n", " ")
@@ -961,6 +967,8 @@ class Vt6TrainingServer(QtCore.QObject):
                 )
         except OSError as error:
             print(f"Unable to write RPi error log: {error}", file=sys.stderr)
+            return False
+        return True
 
     def start_next_capture(self) -> None:
         if (
@@ -1803,6 +1811,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.camera_controller.start()
 
+        self.error_notifications = ErrorNotificationManager(self)
         self.vt6_server: Optional[Vt6TrainingServer] = None
         if tcp_enabled:
             self.vt6_server = Vt6TrainingServer(
@@ -1818,6 +1827,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 parent=self,
             )
             self.vt6_server.status_changed.connect(self.update_vt6_status)
+            self.vt6_server.error_recorded.connect(
+                self.error_notifications.notify, QtCore.Qt.QueuedConnection
+            )
             self.vt6_server.start()
         else:
             self.update_vt6_status("VT6 service disabled", False)
@@ -1980,6 +1992,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "The camera is finishing a task. Try exiting again shortly.",
             )
             return
+        self.error_notifications.shutdown()
         super().closeEvent(event)
 
 

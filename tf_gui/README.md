@@ -1,6 +1,6 @@
 # TF Inner GUI
 
-当前版本：`v0.4.9`。主界面名称为 `TF Inspection`，保留版本号；摄像头就绪时仅显示 `Camera ready`，不再附加分辨率和曝光说明。尚未校准时仍提示 `Not calibrated`，摄像头页面保留详细信息。触摸屏菜单和运行状态均使用英文。
+当前版本：`v0.4.10`。主界面名称为 `TF Inspection`，保留版本号；摄像头就绪时仅显示 `Camera ready`，不再附加分辨率和曝光说明。尚未校准时仍提示 `Not calibrated`，摄像头页面保留详细信息。触摸屏菜单和运行状态均使用英文。
 
 ## 相机超时与恢复
 
@@ -198,6 +198,62 @@ NP_X,NP_Y,NP_Z,NP_U,NPS_X,NPS_Y,NPS_Z,NPS_U,DROP_X,DROP_Y,DROP_Z,DROP_U
 python3 main.py --tcp-port 5001
 python3 main.py --no-tcp
 ```
+
+## Epson 错误提示弹窗
+
+`error_notifications.py` 是独立的错误提示模块，只消费收到的 Epson 错误文字，
+不操作相机、不向机器人发送指令，也不改变检测结果。只有收到 Epson 回传的错误
+才显示提示；本机 INNER/GLUE 检测到 NG 时不会直接弹窗。
+
+收到错误后先完成 `error_records/error.log` 中的 `RECEIVED` 日志写入，再异步显示
+弹窗，不等待故障照片拍摄或保存。相机未就绪、拍照队列已满或照片保存失败也不影响
+提示；如果日志写入失败，仍显示错误，并注明日志未能写入。
+
+- 标题直接显示错误代码，例如 `NO_GLUE`，下方为说明和多条 `Suggested checks`。
+- 未配置的错误仅显示 Epson 原文；内容作为纯文本显示。
+- 只有一个 `Confirm` 按钮，仅关闭当前提示，不会复位机器人、回复 OK 或重启设备。
+- 弹窗非模态，未确认时相机、TCP 通信和其他页面继续工作；在 Camera Results 或调整页面也可确认关闭。
+- 首次显示后 1200 秒（20 分钟）自动关闭。重复或新增错误不会延长这次弹窗的截止时间。
+- 同一错误累计次数，不同错误在同一滚动区域追加。最多显示最近 100 种未确认错误，超出时提示省略数量；原始日志仍完整保留。
+- 标题 32px、说明 26px、建议 24px；确认按钮固定在滚动区之外，小屏也能操作。
+
+随程序发布的英文错误表是：
+
+```text
+config/error_messages.json
+```
+
+当前包含 15 个错误代码及 39 条处理建议。`checks` 是字符串数组，可配置多条，
+每条显示为一个编号。示例：
+
+```json
+{
+  "schema_version": 1,
+  "language": "en",
+  "errors": {
+    "NO_GLUE": {
+      "description": "GLUE inspection did not pass on one or both sides.",
+      "checks": [
+        "Check whether glue is present on the most recently processed parts.",
+        "Check the glue machine pump."
+      ]
+    }
+  }
+}
+```
+
+需要保留现场自定义内容、避免 Git 更新覆盖时，把整份默认文件复制到：
+
+```text
+~/.config/tf_inner/error_messages.json
+```
+
+程序优先读取这份本机文件，它是整表替换，不是逐项合并。没有本机文件时使用随程序
+发布的默认表。配置在程序启动时读取并缓存，修改后重新启动检测程序生效；不增加
+周期轮询。配置缺失、JSON 格式错误或字段类型不正确时，程序继续运行，弹窗只显示
+Epson 原文，并将配置加载错误写入程序日志。模块另提供 `catalog.reload()` 供集成调用。
+
+建议文字仅用于人工排查，程序不会自动执行其中的清洗、更换或重启操作。
 
 ## 在 Windows PC 上编辑和测试
 

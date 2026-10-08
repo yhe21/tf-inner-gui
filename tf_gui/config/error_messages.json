@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "language": "en",
+  "errors": {
+    "NO_GLUE": {
+      "description": "GLUE inspection did not pass on one or both sides.",
+      "checks": [
+        "Check whether glue is present on the most recently processed parts.",
+        "Check the glue machine pump.",
+        "Clean the nozzle.",
+        "Purge the glue system.",
+        "Check the moleskin on the stamping station."
+      ]
+    },
+    "NO_INNER": {
+      "description": "INNER inspection did not pass on one or both sides.",
+      "checks": [
+        "Check the last tray for missing INNER components.",
+        "Check the gripper.",
+        "Check the fixture."
+      ]
+    },
+    "NO_NP": {
+      "description": "The robot reported an NP inspection NG result.",
+      "checks": [
+        "Check that the nameplates are present and correctly positioned.",
+        "Review any available image of the affected parts.",
+        "Check nameplate seating and any obstruction at the inspection position."
+      ]
+    },
+    "NO_PART_FROM_CONVEYOR": {
+      "description": "The conveyor pickup-ready signal was not received within 150 seconds.",
+      "checks": [
+        "Check the conveyor for jams.",
+        "Check whether the sensor is working correctly."
+      ]
+    },
+    "PICK_PART_NO_VAC": {
+      "description": "One or both vacuum sensors did not confirm the part pickup.",
+      "checks": [
+        "Replace the suction cups.",
+        "Clear any blockage in the vacuum generator.",
+        "Check the tubing for air leaks.",
+        "Check whether the pickup location has shifted."
+      ]
+    },
+    "PICK_PART_WAIT_TIMEOUT": {
+      "description": "The part-transfer permission signals did not reach the required state within 25 seconds.",
+      "checks": [
+        "Check the T6 for a fault preventing completion of NP placement.",
+        "Check whether the NP tray is ready."
+      ]
+    },
+    "DROP_PART_WAIT_TIMEOUT": {
+      "description": "Permission to place the parts in the fixture was not received within 25 seconds.",
+      "checks": [
+        "Check the T6 for a fault after NP placement and before INNER placement is complete.",
+        "Check the feeder bowl for jams or other problems."
+      ]
+    },
+    "NP_LOCATION_INVALID": {
+      "description": "The nameplate pickup location number is invalid; NP_Loc must be 1 or 2.",
+      "checks": [
+        "Check for an internal counter error.",
+        "Restart the machine."
+      ]
+    },
+    "PICK_NP_NO_VAC": {
+      "description": "One or both vacuum sensors did not confirm the nameplate pickup.",
+      "checks": [
+        "Check the NP tray for missing nameplates.",
+        "Check whether the T6 pickup operation is working correctly.",
+        "Try restarting the machine."
+      ]
+    },
+    "DROP_NP_WAIT_TIMEOUT": {
+      "description": "Permission to place the nameplates was not received within 25 seconds.",
+      "checks": [
+        "Check whether the fixture moves correctly.",
+        "Check the moleskin on the stamping station."
+      ]
+    },
+    "PICK_FIXTURE_WAIT_TIMEOUT": {
+      "description": "Permission to pick the assembled parts from the fixture was not received within 25 seconds.",
+      "checks": [
+        "Check whether the fixture moves correctly.",
+        "Check the moleskin on the stamping station."
+      ]
+    },
+    "PICK_FIXTURE_NO_VAC": {
+      "description": "Vacuum was not confirmed after fixture or buffer pickup, or before pallet placement.",
+      "checks": [
+        "Check whether AC is operating normally.",
+        "Check the fixture for tape residue, glue residue or foreign objects.",
+        "Check the suction cups."
+      ]
+    },
+    "PALLET_NOT_READY": {
+      "description": "The IsPalletOk signal remained OFF after the pallet-ready wait of up to 15 seconds.",
+      "checks": [
+        "Check whether the plate is ready.",
+        "Gently push the plate to check whether the motor is enabled."
+      ]
+    },
+    "SECOND_PLACE_TIMEOUT": {
+      "description": "The pallet position signal (okPosition) was still OFF after the second-place reset and position waits.",
+      "checks": [
+        "Check whether the plate is ready.",
+        "Gently push the plate to check whether the motor is enabled."
+      ]
+    },
+    "CALI_STOP": {
+      "description": "The calibration routine was entered and intentionally stopped by the robot program.",
+      "checks": [
+        "Confirm whether entering the calibration routine was intentional.",
+        "Have maintenance verify the selected routine and calibration procedure."
+      ]
+    }
+  }
+}
