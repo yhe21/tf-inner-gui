@@ -199,6 +199,25 @@ class EpsonNotificationProtocolTests(unittest.TestCase):
         self.assertIsNotNone(self.server.active_capture)
         self.controller.worker.stop.assert_not_called()
 
+    def test_new_error_replaces_popup_but_preserves_every_received_log(self):
+        self.controller.ready = False
+        codes = ("NO_GLUE", "NO_INNER", "Unlisted robot fault")
+        current_dialog = None
+        for code in codes:
+            self.server.handle_command(code, 1)
+            self.app.processEvents()
+            if current_dialog is None:
+                current_dialog = self.manager.dialog
+            self.assertIs(self.manager.dialog, current_dialog)
+            self.assertEqual(current_dialog.message.code, code)
+            titles = current_dialog.findChildren(QtWidgets.QLabel, "errorCode")
+            self.assertEqual([label.text() for label in titles], [code])
+        log = (self.server.error_root / "error.log").read_text(encoding="utf-8")
+        for code in codes:
+            self.assertIn(f"\t{code}\tRECEIVED\t", log)
+        self.assertEqual(self.events, [(code, True) for code in codes])
+        self.assertEqual(self.client.writes, [])
+
     def test_real_tcp_continues_while_notification_is_unconfirmed(self):
         self.server.current_client = None
         self.server.client_buffers.clear()

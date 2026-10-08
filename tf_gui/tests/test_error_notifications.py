@@ -179,15 +179,18 @@ class ErrorNotificationDialogTests(unittest.TestCase):
     def labels(self, dialog, name):
         return dialog.findChildren(QtWidgets.QLabel, name)
 
-    def test_default_timeout_is_twenty_minutes(self):
-        parameter = inspect.signature(ErrorNotificationManager).parameters["timeout_ms"]
-        self.assertEqual(parameter.default, 1_200_000)
+    def test_popup_has_no_auto_close_timer_and_remains_until_confirmation(self):
+        self.assertNotIn("timeout_ms", inspect.signature(ErrorNotificationManager).parameters)
         manager = self.manager()
         manager.notify("NO_GLUE")
-        timer = manager.dialog.findChild(QtCore.QTimer, "autoCloseTimer")
-        self.assertIsNotNone(timer)
-        self.assertTrue(timer.isActive())
-        self.assertEqual(timer.interval(), 1_200_000)
+        dialog = manager.dialog
+        self.assertFalse(dialog.findChildren(QtCore.QTimer))
+        self.assertFalse(self.labels(dialog, "timeoutHint"))
+        QtTest.QTest.qWait(180)
+        self.assertIs(manager.dialog, dialog)
+        self.assertTrue(dialog.isVisible())
+        dialog.confirm_button.click()
+        self.assertIsNone(manager.dialog)
 
     def test_known_error_has_code_description_checks_and_one_confirm(self):
         manager = self.manager()
@@ -199,6 +202,7 @@ class ErrorNotificationDialogTests(unittest.TestCase):
         self.assertEqual(dialog.windowModality(), QtCore.Qt.NonModal)
         self.assertEqual([label.text() for label in self.labels(dialog, "errorCode")], ["NO_GLUE"])
         self.assertEqual([label.text() for label in self.labels(dialog, "errorDescription")], [ERRORS["NO_GLUE"]["description"]])
+        self.assertEqual([label.text() for label in self.labels(dialog, "checksHeading")], ["Suggestion"])
         checks = self.labels(dialog, "suggestedCheck")
         self.assertEqual(len(checks), 3)
         for label, expected in zip(checks, ERRORS["NO_GLUE"]["checks"]):
@@ -209,6 +213,25 @@ class ErrorNotificationDialogTests(unittest.TestCase):
         scroll = dialog.findChild(QtWidgets.QScrollArea, "errorScrollArea")
         self.assertIsNotNone(scroll)
         self.assertFalse(scroll.isAncestorOf(buttons[0]))
+
+    def test_all_visible_text_uses_larger_fonts(self):
+        manager = self.manager()
+        manager.notify("NO_GLUE", log_written=False)
+        dialog = manager.dialog
+        self.app.processEvents()
+        expected_sizes = {
+            "errorCode": 34,
+            "errorDescription": 28,
+            "checksHeading": 26,
+            "suggestedCheck": 26,
+            "logWriteWarning": 22,
+        }
+        for name, expected in expected_sizes.items():
+            with self.subTest(label=name):
+                labels = self.labels(dialog, name)
+                self.assertTrue(labels)
+                self.assertTrue(all(label.font().pixelSize() == expected for label in labels))
+        self.assertEqual(dialog.confirm_button.font().pixelSize(), 28)
 
     def test_unknown_error_shows_received_text_without_generic_advice(self):
         manager = self.manager()
@@ -254,32 +277,85 @@ class ErrorNotificationDialogTests(unittest.TestCase):
         self.assertIsNone(self.app.activeModalWidget())
         timer.stop()
 
-    def test_duplicate_merges_and_distinct_error_appends_without_another_window(self):
+    def test_distinct_error_replaces_previous_message_in_same_window(self):
         manager = self.manager()
         manager.notify("NO_GLUE")
         dialog = manager.dialog
-        manager.notify("NO_GLUE")
         manager.notify("NO_INNER")
+        self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
         self.app.processEvents()
         self.assertIs(manager.dialog, dialog)
-        self.assertEqual([entry.message.code for entry in dialog.entries.values()], ["NO_GLUE", "NO_INNER"])
-        self.assertEqual(next(entry for entry in dialog.entries.values() if entry.message.code == "NO_GLUE").count, 2)
-        self.assertEqual(next(entry for entry in dialog.entries.values() if entry.message.code == "NO_INNER").count, 1)
-        self.assertEqual(len(self.labels(dialog, "errorCode")), 2)
+        self.assertEqual(dialog.message.code, "NO_INNER")
+        self.assertEqual([label.text() for label in self.labels(dialog, "errorCode")], ["NO_INNER"])
+        self.assertEqual([label.text() for label in self.labels(dialog, "errorDescription")],
+                         [ERRORS["NO_INNER"]["description"]])
+        self.assertEqual([label.text() for label in self.labels(dialog, "suggestedCheck")],
+                         [f"{i}. {check}" for i, check in enumerate(ERRORS["NO_INNER"]["checks"], 1)])
+        self.assertFalse(self.labels(dialog, "occurrenceCount"))
         self.assertEqual(len(dialog.findChildren(QtWidgets.QPushButton)), 1)
 
-    def test_repeated_and_distinct_errors_do_not_extend_original_deadline(self):
-        manager = self.manager(timeout_ms=400)
-        manager.notify("NO_GLUE")
+    def test_same_code_replaces_content_and_does_not_accumulate_occurrences(self):
+        manager = self.manager()
+        manager.notify("NO_GLUE", log_written=False)
         dialog = manager.dialog
-        timer = dialog.findChild(QtCore.QTimer, "autoCloseTimer")
-        QtTest.QTest.qWait(220)
-        before_repeat = timer.remainingTime()
-        manager.notify("NO_GLUE")
-        manager.notify("NO_INNER")
-        self.assertLessEqual(timer.remainingTime(), before_repeat + 10)
-        QtTest.QTest.qWait(240)
-        self.assertIsNone(manager.dialog)
+        write_catalog(self.defaults, {"NO_GLUE": {
+            "description": "Latest description", "checks": ["Latest suggestion"],
+        }})
+        self.assertTrue(self.catalog.reload())
+        manager.notify("NO_GLUE", log_written=True)
+        self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        self.app.processEvents()
+        self.assertIs(manager.dialog, dialog)
+        self.assertEqual(dialog.message.description, "Latest description")
+        self.assertEqual([label.text() for label in self.labels(dialog, "errorDescription")],
+                         ["Latest description"])
+        self.assertEqual([label.text() for label in self.labels(dialog, "suggestedCheck")],
+                         ["1. Latest suggestion"])
+        self.assertEqual(len(self.labels(dialog, "errorCode")), 1)
+        self.assertFalse(self.labels(dialog, "occurrenceCount"))
+        self.assertFalse(any(label.isVisible() for label in self.labels(dialog, "logWriteWarning")))
+
+    def test_unknown_replacement_clears_previous_description_suggestions_and_warning(self):
+        manager = self.manager()
+        manager.notify("NO_GLUE", log_written=False)
+        dialog = manager.dialog
+        raw = "Custom_Error <b>IMPORTANT</b> & latest details"
+        manager.notify(raw, log_written=True)
+        self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        self.app.processEvents()
+        self.assertIs(manager.dialog, dialog)
+        self.assertEqual(dialog.message.raw_text, raw)
+        titles = self.labels(dialog, "errorCode")
+        self.assertEqual([label.text() for label in titles], [raw])
+        self.assertEqual(titles[0].textFormat(), QtCore.Qt.PlainText)
+        self.assertFalse(self.labels(dialog, "errorDescription"))
+        self.assertFalse(self.labels(dialog, "checksHeading"))
+        self.assertFalse(self.labels(dialog, "suggestedCheck"))
+        self.assertFalse(any(label.isVisible() for label in self.labels(dialog, "logWriteWarning")))
+
+    def test_replacement_resets_scrolled_content_to_top(self):
+        long_errors = {code: {
+            "description": f"{code} details. " * 25,
+            "checks": [f"Check {i}: " + "A longer operator instruction. " * 8 for i in range(12)],
+        } for code in ("LONG_FIRST", "LONG_SECOND")}
+        write_catalog(self.defaults, long_errors)
+        self.assertTrue(self.catalog.reload())
+        manager = self.manager()
+        manager.notify("LONG_FIRST")
+        dialog = manager.dialog
+        self.app.processEvents()
+        scrollbar = dialog.scroll.verticalScrollBar()
+        self.assertGreater(scrollbar.maximum(), 0)
+        scrollbar.setValue(scrollbar.maximum())
+        self.assertGreater(scrollbar.value(), 0)
+        manager.notify("LONG_SECOND")
+        self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        self.app.processEvents()
+        self.assertIs(manager.dialog, dialog)
+        self.assertEqual(dialog.message.code, "LONG_SECOND")
+        self.assertGreater(scrollbar.maximum(), 0)
+        self.assertEqual(scrollbar.value(), 0)
+        self.assertEqual([label.text() for label in self.labels(dialog, "errorCode")], ["LONG_SECOND"])
 
     def test_confirmation_cleans_state_and_next_error_opens_fresh_window(self):
         manager = self.manager()
@@ -289,14 +365,14 @@ class ErrorNotificationDialogTests(unittest.TestCase):
         self.wait_until(lambda: manager.dialog is None)
         manager.notify("NO_GLUE")
         self.assertIsNot(manager.dialog, first)
-        self.assertEqual(next(entry for entry in manager.dialog.entries.values() if entry.message.code == "NO_GLUE").count, 1)
+        self.assertEqual(manager.dialog.message.code, "NO_GLUE")
+        self.assertEqual(len(self.labels(manager.dialog, "errorCode")), 1)
         self.assertTrue(manager.dialog.isVisible())
 
     def test_failed_log_write_still_displays_fault_and_warning(self):
         manager = self.manager()
         manager.notify("NO_GLUE", log_written=False)
         self.assertTrue(manager.dialog.isVisible())
-        self.assertFalse(next(entry for entry in manager.dialog.entries.values() if entry.message.code == "NO_GLUE").log_written)
         warnings = self.labels(manager.dialog, "logWriteWarning")
         self.assertEqual(len(warnings), 1)
         self.assertTrue(warnings[0].text().strip())
@@ -414,13 +490,10 @@ class ErrorNotificationDialogTests(unittest.TestCase):
             modal.close()
             modal.deleteLater()
 
-    def test_opening_and_closing_modal_page_preserves_popup_deadline(self):
-        manager = self.manager(timeout_ms=700)
+    def test_opening_and_closing_modal_page_preserves_latest_popup_until_confirmation(self):
+        manager = self.manager()
         manager.notify("NO_GLUE")
         dialog = manager.dialog
-        timer = dialog.findChild(QtCore.QTimer, "autoCloseTimer")
-        QtTest.QTest.qWait(100)
-        previous_remaining = timer.remainingTime()
         modal = QtWidgets.QDialog(self.parent)
         modal.setModal(True)
         modal.resize(800, 480)
@@ -429,33 +502,35 @@ class ErrorNotificationDialogTests(unittest.TestCase):
             self.wait_until(lambda: dialog.parentWidget() is modal)
             self.assertIs(manager.dialog, dialog)
             self.assertTrue(dialog.isVisible())
-            self.assertLessEqual(timer.remainingTime(), previous_remaining + 10)
+            manager.notify("NO_INNER")
+            self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+            self.app.processEvents()
             modal.close()
             self.wait_until(lambda: dialog.parentWidget() is self.parent)
-            self.assertLessEqual(timer.remainingTime(), previous_remaining + 10)
-            self.wait_until(lambda: manager.dialog is None)
+            QtTest.QTest.qWait(180)
+            self.assertIs(manager.dialog, dialog)
+            self.assertTrue(dialog.isVisible())
+            self.assertEqual(dialog.message.code, "NO_INNER")
+            self.assertFalse(dialog.findChildren(QtCore.QTimer))
+            dialog.confirm_button.click()
+            self.assertIsNone(manager.dialog)
         finally:
             modal.close()
             modal.deleteLater()
 
-    def test_many_different_faults_keep_latest_hundred_and_single_confirm(self):
+    def test_many_different_faults_keep_only_latest_message_and_single_confirm(self):
         manager = self.manager()
         for index in range(105):
             manager.notify(f"UNLISTED_FAULT_{index}")
         dialog = manager.dialog
         self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
         self.app.processEvents()
-        entries = list(dialog.entries.values())
-        self.assertEqual(len(entries), 100)
-        self.assertEqual(entries[0].message.raw_text, "UNLISTED_FAULT_5")
-        self.assertEqual(entries[-1].message.raw_text, "UNLISTED_FAULT_104")
-        self.assertEqual(dialog.omitted_count, 5)
-        self.assertEqual(len(self.labels(dialog, "errorCode")), 100)
+        self.assertEqual(dialog.message.raw_text, "UNLISTED_FAULT_104")
+        self.assertEqual([label.text() for label in self.labels(dialog, "errorCode")],
+                         ["UNLISTED_FAULT_104"])
         self.assertEqual(len(dialog.findChildren(QtWidgets.QPushButton)), 1)
-        omitted = self.labels(dialog, "omittedErrors")
-        self.assertEqual(len(omitted), 1)
-        self.assertTrue(omitted[0].isVisible())
-        self.assertIn("5", omitted[0].text())
+        self.assertFalse(self.labels(dialog, "omittedErrors"))
+        self.assertFalse(self.labels(dialog, "occurrenceCount"))
 
     def test_deleting_modal_page_preserves_popup_until_confirmation(self):
         modal = QtWidgets.QDialog(self.parent)

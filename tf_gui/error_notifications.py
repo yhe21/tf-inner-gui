@@ -6,18 +6,15 @@ module never talks to the robot or camera and does not interpret AI results.
 
 import json
 import logging
-from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from PyQt5 import QtCore, QtGui, QtWidgets, sip
+from PyQt5 import QtCore, QtWidgets, sip
 
 
 DEFAULT_MESSAGES_PATH = Path(__file__).resolve().parent / "config" / "error_messages.json"
 OVERRIDE_MESSAGES_PATH = Path.home() / ".config" / "tf_inner" / "error_messages.json"
-DEFAULT_TIMEOUT_MS = 1_200_000
-MAX_PENDING_ERRORS = 100
 MAX_CATALOG_BYTES = 1_048_576
 _LOG = logging.getLogger(__name__)
 
@@ -99,46 +96,30 @@ class ErrorMessageCatalog:
                             description=entry[0], checks=entry[1], known=True)
 
 
-@dataclass
-class NotificationEntry:
-    message: ErrorMessage
-    count: int = 1
-    log_written: bool = True
-
-
 class ErrorNotificationDialog(QtWidgets.QDialog):
-    """One modeless dialog containing bounded, coalesced unconfirmed errors."""
+    """Show only the latest error until the operator dismisses the dialog."""
 
-    def __init__(self, parent=None, timeout_ms=DEFAULT_TIMEOUT_MS):
+    def __init__(self, parent=None):
         super().__init__(parent, QtCore.Qt.Dialog | QtCore.Qt.FramelessWindowHint)
         self.setObjectName("errorNotificationDialog")
         self.setWindowTitle("Epson error")
         self.setWindowModality(QtCore.Qt.NonModal)
         self.setModal(False)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
-        self.entries = OrderedDict()
-        self._cards = {}
-        self._timeout_ms = max(1, int(timeout_ms))
-        self._timeout_started = False
-        self.omitted_count = 0
-        self.timer = QtCore.QTimer(self)
-        self.timer.setObjectName("autoCloseTimer")
-        self.timer.setSingleShot(True)
-        self.timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self.timer.timeout.connect(self.reject)
+        self.message: Optional[ErrorMessage] = None
+        self.log_written = True
         self.setStyleSheet("""
             QDialog#errorNotificationDialog { background: white; border: 2px solid #d5dde5; border-radius: 16px; }
             QScrollArea#errorScrollArea, QWidget#errorContent { background: white; border: none; }
             QFrame#errorCard { background: white; border: none; border-bottom: 1px solid #d5dde5; }
             QLabel { color: #172033; background: transparent; border: none; }
-            QLabel#errorCode { color: #b42318; font-size: 32px; font-weight: 700; }
-            QLabel#errorDescription { font-size: 26px; }
-            QLabel#checksHeading { font-size: 24px; font-weight: 700; margin-top: 8px; }
-            QLabel#suggestedCheck { font-size: 24px; }
-            QLabel#occurrenceCount, QLabel#timeoutHint, QLabel#omittedErrors { font-size: 18px; color: #526174; }
-            QLabel#logWriteWarning { font-size: 20px; color: #b42318; font-weight: 600; }
+            QLabel#errorCode { color: #b42318; font-size: 34px; font-weight: 700; }
+            QLabel#errorDescription { font-size: 28px; }
+            QLabel#checksHeading { font-size: 26px; font-weight: 700; margin-top: 8px; }
+            QLabel#suggestedCheck { font-size: 26px; }
+            QLabel#logWriteWarning { font-size: 22px; color: #b42318; font-weight: 600; }
             QPushButton#confirmButton { color: white; background: #2367a8; border: none;
-                border-radius: 12px; font-size: 26px; font-weight: 700; min-height: 64px; }
+                border-radius: 12px; font-size: 28px; font-weight: 700; min-height: 64px; }
             QPushButton#confirmButton:pressed { background: #174c80; }
             QPushButton#confirmButton:focus { border: 3px solid #8ebce7; }
             QScrollBar:vertical { width: 22px; }
@@ -151,22 +132,9 @@ class ErrorNotificationDialog(QtWidgets.QDialog):
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.content = QtWidgets.QWidget()
-        self.content.setObjectName("errorContent")
-        self.content_layout = QtWidgets.QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(0, 0, 8, 0)
-        self.content_layout.setSpacing(18)
-        self.content_layout.addStretch(1)
-        self.scroll.setWidget(self.content)
         QtWidgets.QScroller.grabGesture(self.scroll.viewport(), QtWidgets.QScroller.LeftMouseButtonGesture)
         layout.addWidget(self.scroll, 1)
-        self.omitted_label = self._label("", "omittedErrors")
-        self.omitted_label.hide()
-        layout.addWidget(self.omitted_label)
-        seconds = self._timeout_ms / 1000
-        duration = f"{int(seconds / 60)} minutes" if seconds >= 60 and seconds % 60 == 0 else f"{seconds:g} seconds"
-        self.timeout_label = self._label(f"Closes automatically after {duration}.", "timeoutHint")
-        layout.addWidget(self.timeout_label)
+        self.content: Optional[QtWidgets.QWidget] = None
         self.confirm_button = QtWidgets.QPushButton("Confirm", self)
         self.confirm_button.setObjectName("confirmButton")
         self.confirm_button.setMinimumHeight(64)
@@ -185,29 +153,21 @@ class ErrorNotificationDialog(QtWidgets.QDialog):
         label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         return label
 
-    def add_message(self, message: ErrorMessage, log_written: bool = True) -> None:
-        # Unknown text is its own key, preserving case, spaces and markup.
-        key = ("known:" if message.known else "raw:") + message.code
-        if key in self.entries:
-            entry = self.entries[key]
-            entry.count += 1
-            entry.log_written = entry.log_written and log_written
-            _, count_label, warning = self._cards[key]
-            count_label.setText(f"Reported {entry.count} times")
-            count_label.show()
-            warning.setVisible(not entry.log_written)
-            return
-        if len(self.entries) >= MAX_PENDING_ERRORS:
-            old_key, _ = self.entries.popitem(last=False)
-            old_card, _, _ = self._cards.pop(old_key)
-            self.content_layout.removeWidget(old_card)
-            old_card.hide()
-            old_card.deleteLater()
-            self.omitted_count += 1
-            self.omitted_label.setText(f"Older alerts not shown: {self.omitted_count}")
-            self.omitted_label.show()
-        entry = NotificationEntry(message, log_written=log_written)
-        self.entries[key] = entry
+    def set_message(self, message: ErrorMessage, log_written: bool = True) -> None:
+        # A new report replaces the entire previous message, including advice,
+        # log-write status and scroll position. Original events remain in the log.
+        self.message = message
+        self.log_written = log_written
+        QtWidgets.QScroller.scroller(self.scroll.viewport()).stop()
+        previous = self.scroll.takeWidget()
+        if previous is not None:
+            previous.hide()
+            previous.deleteLater()
+        self.content = QtWidgets.QWidget()
+        self.content.setObjectName("errorContent")
+        content_layout = QtWidgets.QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 8, 0)
+        content_layout.setSpacing(18)
         card = QtWidgets.QFrame(self.content)
         card.setObjectName("errorCard")
         card.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
@@ -218,31 +178,15 @@ class ErrorNotificationDialog(QtWidgets.QDialog):
         if message.description:
             card_layout.addWidget(self._label(message.description, "errorDescription"))
         if message.checks:
-            card_layout.addWidget(self._label("Suggested checks", "checksHeading"))
+            card_layout.addWidget(self._label("Suggestion", "checksHeading"))
             for number, check in enumerate(message.checks, 1):
                 card_layout.addWidget(self._label(f"{number}. {check}", "suggestedCheck"))
-        count_label = self._label("", "occurrenceCount")
-        count_label.hide()
-        card_layout.addWidget(count_label)
-        warning = self._label("The error log could not be written.", "logWriteWarning")
-        warning.setVisible(not log_written)
-        card_layout.addWidget(warning)
-        self._cards[key] = (card, count_label, warning)
-        self.content_layout.insertWidget(self.content_layout.count() - 1, card)
-
-    def showEvent(self, event: QtGui.QShowEvent) -> None:
-        super().showEvent(event)
-        if not self._timeout_started:
-            self._timeout_started = True
-            self.timer.start(self._timeout_ms)
-
-    def done(self, result: int) -> None:
-        self.timer.stop()
-        super().done(result)
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.timer.stop()
-        super().closeEvent(event)
+        if not log_written:
+            card_layout.addWidget(self._label("The error log could not be written.", "logWriteWarning"))
+        content_layout.addWidget(card)
+        content_layout.addStretch(1)
+        self.scroll.setWidget(self.content)
+        self.scroll.verticalScrollBar().setValue(0)
 
     def fit_to_parent(self) -> None:
         parent = self.parentWidget()
@@ -262,11 +206,10 @@ class ErrorNotificationDialog(QtWidgets.QDialog):
 class ErrorNotificationManager(QtCore.QObject):
     """Own the popup and follow modal pages without blocking their event loop."""
 
-    def __init__(self, parent: QtWidgets.QWidget, catalog=None, timeout_ms=DEFAULT_TIMEOUT_MS):
+    def __init__(self, parent: QtWidgets.QWidget, catalog=None):
         super().__init__(parent)
         self._root = parent
         self.catalog = catalog if catalog is not None else ErrorMessageCatalog()
-        self.timeout_ms = timeout_ms
         self.dialog: Optional[ErrorNotificationDialog] = None
         self._stopped = False
         self._reparenting = False
@@ -283,16 +226,16 @@ class ErrorNotificationManager(QtCore.QObject):
             return
         message = self.catalog.resolve(raw_text)
         if self.dialog is None:
-            dialog = ErrorNotificationDialog(self._target_parent(), self.timeout_ms)
+            dialog = ErrorNotificationDialog(self._target_parent())
             self.dialog = dialog
             dialog.finished.connect(lambda result, current=dialog: self._finished(current))
-            dialog.add_message(message, log_written)
+            dialog.set_message(message, log_written)
             dialog.fit_to_parent()
             dialog.show()
             dialog.raise_()
             dialog.confirm_button.setFocus(QtCore.Qt.OtherFocusReason)
         else:
-            self.dialog.add_message(message, log_written)
+            self.dialog.set_message(message, log_written)
             self._retarget()
             self.dialog.raise_()
 
