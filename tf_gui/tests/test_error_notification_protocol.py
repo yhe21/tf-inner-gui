@@ -164,15 +164,17 @@ class EpsonNotificationProtocolTests(unittest.TestCase):
         self.assertEqual(self.client.writes, [b"GLUE,OK\r\n"])
 
     def test_local_ng_only_replies_and_epson_return_is_the_notification(self):
-        for command, error in (("GLUE", "NO_GLUE"), ("INNER", "NO_INNER")):
+        cases = (("GLUE", "NO_GLUE", ("OK", "NG")), ("INNER", "NO_INNER", ("NG",)))
+        for command, error, replies in cases:
             with self.subTest(command=command):
-                self.server.handle_command(command, 1)
-                side = SidePrediction("NG", 0.99)
-                self.controller.on_inspection_completed(InspectionResult(command, "NG", side, side, 50.0))
-                self.app.processEvents()
-                self.assertEqual(self.client.writes[-1], f"{command},NG\r\n".encode())
-                self.assertIsNone(self.manager.dialog)
-                self.finish_capture()
+                for reply in replies:
+                    self.server.handle_command(command, 1)
+                    side = SidePrediction("NG", 0.99)
+                    self.controller.on_inspection_completed(InspectionResult(command, "NG", side, side, 50.0))
+                    self.app.processEvents()
+                    self.assertEqual(self.client.writes[-1], f"{command},{reply}\r\n".encode())
+                    self.assertIsNone(self.manager.dialog)
+                    self.finish_capture()
                 self.server.handle_command(error, 1)
                 self.app.processEvents()
                 self.assertTrue(self.manager.dialog.isVisible())

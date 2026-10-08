@@ -88,9 +88,9 @@ CALI_STOP
   restarting; do not treat this as an automatic recovery procedure.
 - NP remains capture-only: the RPi does not run an NP classifier and replies
   `NP,OK`, including camera-unavailable, queue-full, and capture-failure paths.
-  RPi GUI v0.4.7 enables production replies: INNER sends NG on each valid NG
-  result; GLUE sends OK for its first two consecutive NG results and NG from
-  the third onward. GLUE OK, invalid inspections, camera unavailability,
+  RPi GUI v0.4.12 uses these production replies: INNER sends NG on each valid NG
+  result; GLUE sends OK for its first NG result and NG from
+  the second consecutive NG onward. GLUE OK, invalid inspections, camera unavailability,
   bypass, or a fresh TCP session reset the streak. Normal INNER/NP captures
   between GLUE captures do not reset it. Camera/model failures retain the
   explicitly requested OK fallback. See the GUI README for full semantics.
