@@ -161,7 +161,7 @@ python3 tools/test_frame_capture.py --self-test \
 | 阶段 | 默认限时 | 超时后的行为 |
 | --- | --- | --- |
 | 启动相机 | 10 秒 | 抛出 `FrameUnavailable("timeout", ...)`，请求停止并清理 |
-| 等待相机新请求 | 连续 3 秒没有进展 | 采集状态变为 `failed`，记录错误，尝试释放请求并关闭相机 |
+| 等待相机新请求 | 连续 200 ms 没有进展 | 采集状态变为 `failed`，记录错误，尝试释放请求并关闭相机 |
 | 按信号查询 | 模块默认 1 秒；测试脚本默认 2 秒 | 抛出 `FrameUnavailable("timeout", ...)`，不返回未经确认的旧帧 |
 | 停止和清理 | 3 秒 | 报告清理超时，不声称相机已释放 |
 
@@ -184,6 +184,7 @@ git pull --ff-only &&
   --duration 600 \
   --capacity 30 \
   --settings "$HOME/.config/tf_inner/camera_settings.json" \
+  --frame-timeout 0.2 \
   --sample-interval 5 \
   --query-interval 1 \
   --report "$HOME/frame-capture-10min.json" \

@@ -79,7 +79,7 @@ class CaptureConfig:
     memory_budget_mb: float | None = None
     camera_num: int = 0
     camera_buffer_count: int = 4
-    frame_timeout: float = 3.0
+    frame_timeout: float = 0.2
     start_timeout: float = 10.0
 
     def __post_init__(self) -> None:

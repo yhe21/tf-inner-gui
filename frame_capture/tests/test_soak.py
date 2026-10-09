@@ -219,10 +219,12 @@ class SoakRunnerTests(unittest.TestCase):
     def test_fill_timeout_stops_camera_and_keeps_baseline(self):
         clock = SimulatedClock()
         camera = SimulatedCamera(clock, never_fill=True)
-        report, _, _ = self.run_simulation(clock=clock, camera=camera, fill_timeout=0.25)
+        report, _, _ = self.run_simulation(clock=clock, camera=camera,
+                                         fill_timeout=0.25, frame_timeout=1)
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["baseline_telemetry"]["temperature_c"], 50)
         self.assertFalse(report["checks"]["full_capacity"])
+        self.assertTrue(any(error["reason"] == "fill_timeout" for error in report["errors"]))
         self.assertEqual(camera.stop_calls, 1)
 
     def test_new_throttle_history_excludes_preexisting_baseline_bits(self):
@@ -326,7 +328,7 @@ class SoakRunnerTests(unittest.TestCase):
                 self.assertEqual(config.capacity, 30)
                 self.assertIsNone(config.width)
                 self.assertIsNone(config.height)
-                self.assertEqual(config.frame_timeout, 3)
+                self.assertEqual(config.frame_timeout, 0.2)
 
 
 class SystemTelemetryTests(unittest.TestCase):

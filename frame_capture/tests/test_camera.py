@@ -197,7 +197,7 @@ class CameraCaptureTests(unittest.TestCase):
         self.assertEqual(camera.close_count, 1)
 
     def test_missing_frames_eventually_exposes_a_capture_failure(self):
-        capture, camera = self.make_capture(frame_timeout=0.1)
+        capture, camera = self.make_capture(frame_timeout=CaptureConfig().frame_timeout)
         capture.start()
         wait_until(lambda: capture.stats()["state"] == "failed")
         with self.assertRaises(FrameUnavailable) as error:

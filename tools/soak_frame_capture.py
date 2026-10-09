@@ -381,7 +381,7 @@ def build_parser():
     parser.add_argument("--camera-num", type=int, default=0)
     for name, default in (
         ("duration", 600), ("sample-interval", 5), ("query-interval", 1),
-        ("query-timeout", 2), ("frame-timeout", 3), ("start-timeout", 10),
+        ("query-timeout", 2), ("frame-timeout", 0.2), ("start-timeout", 10),
         ("fill-timeout", 120), ("stop-timeout", 3),
     ):
         parser.add_argument(f"--{name}", type=_positive, default=default)
