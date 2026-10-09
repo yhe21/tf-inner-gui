@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
+from roi_offsets import RoiOffsets, load_roi_offsets
+
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_ROOT = APP_DIR.parent / "models"
@@ -174,8 +176,20 @@ class FixedRoiClassifier:
         model_factory: Optional[Callable[[Path], object]] = None,
         warmup: bool = True,
         ok_confidence_threshold: float = OK_CONFIDENCE_THRESHOLD,
+        roi_offsets: Optional[RoiOffsets] = None,
     ) -> None:
         self.model_root = Path(model_root)
+        self.roi_offsets = roi_offsets if roi_offsets is not None else load_roi_offsets()
+        # Keep the measured base coordinates unchanged. The model always sees
+        # the original crop dimensions and padding, translated in the same
+        # rotated full-resolution coordinate system used by Fiji.
+        self.rois = {
+            command: {
+                side: self.roi_offsets.apply(config[side])
+                for side in ("left", "right")
+            }
+            for command, config in INSPECTION_CONFIG.items()
+        }
         self.ok_confidence_threshold = float(ok_confidence_threshold)
         if not 0.0 <= self.ok_confidence_threshold <= 1.0:
             raise ValueError("OK confidence threshold must be between 0 and 1")
@@ -210,8 +224,8 @@ class FixedRoiClassifier:
         config = INSPECTION_CONFIG[command]
         size = int(config["imgsz"])
         crops = [
-            crop_and_pad(rotated_image, config["left"], size),
-            crop_and_pad(rotated_image, config["right"], size),
+            crop_and_pad(rotated_image, self.rois[command]["left"], size),
+            crop_and_pad(rotated_image, self.rois[command]["right"], size),
         ]
         predictions = [self.models[command].predict(crop) for crop in crops]
 
