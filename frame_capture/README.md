@@ -8,32 +8,41 @@
 
 ## 按需取帧与 INNER/GLUE 流程
 
-为减少空闲时间的相机工作负载，新增独立的 `OnDemandFrameCapture` 和可开关的
-`TriggeredFrameCapture`。当前只在测试分支提供接口和模拟触发测试，尚未接入 TF GUI
-或执行 INNER/GLUE 模型推理；图像由接口返回，交给调用方检测。实际降温幅度需实机测量。
+新增独立的 `KeepAliveFrameCapture` 和可开关的 `TriggeredFrameCapture`：相机首次使用时
+初始化并启动一次，空闲时暂停应用读取和图像复制，下一轮复用同一台已启动的相机。
+保留原来的 `OnDemandFrameCapture`，可对比每次关闭相机的温升和延迟。当前只在测试分支
+提供接口和模拟触发测试，尚未接入 TF GUI 或执行模型推理；图像由接口返回，交给调用方检测。
+
+**保持启动时，传感器和图像处理流水线仍持续工作。** 暂停读取只减少应用层的大图复制、
+缓存写入和相关 CPU/内存流量，不能视为相机休眠。实际降温幅度需要实机比较。
 
 开启按需流程时：
 
-1. `on_inner()` 先取消上一轮延迟任务和连续采集，启动相机，取一个完整图像请求，
-   真正停止并关闭相机后返回 `FrameRecord`，调用方用 `frame.image` 做 INNER 检测。
-2. 从 INNER 图像取完、相机关闭后计时，默认等待 **3 秒**，然后在后台启动连续采集。
-   等待期间相机保持关闭；启动配置耗时另计，因此 3 秒并不代表此时已有首帧。
+1. `on_inner()` 先取消上一轮延迟任务和连续采集，只复制一个新曝光的图像并返回
+   `FrameRecord`，调用方用 `frame.image` 做 INNER 检测。首次调用会初始化并启动相机。
+2. 从 INNER 图像返回后计时，默认等待 **3 秒**，然后在后台开始向循环缓存复制帧。
+   等待期间相机保持启动，应用不提交取帧请求，不复制图像。
 3. 连续采集保留原始分辨率、固定曝光和 **30 帧**环形缓存，最多运行 **6 秒**。
-   6 秒从 `camera.start()` 成功开始计时，内部看门狗自动停止，不依赖外部轮询或 GLUE 到来。
-4. `on_glue(t)` 按原始 `SensorTimestamp < t` 选择最近前帧，然后停止并关闭相机，返回图像。
+   6 秒从本轮连续读取被激活开始计时，内部看门狗自动暂停，不依赖外部轮询或 GLUE 到来。
+4. `on_glue(t)` 按原始 `SensorTimestamp < t` 选择最近前帧，然后暂停读取，返回图像。
    为确认没有遗漏还在传输的前帧，选帧可能短暂等待；查询默认限时 2 秒，6 秒总时限仍有效。
-5. 没有 GLUE 时，6 秒后自动关闭；下一次 INNER 创建新的会话和缓存。
+5. 没有 GLUE 时，6 秒后自动暂停；下一次 INNER 复用相机，新建本轮缓存。
+   正常暂停时排空并释放已经提交的请求，丢弃内部缓存，不停止或关闭相机。
 
 | 基础接口 | 返回与行为 |
 | --- | --- |
-| `session.capture_one()` | 返回一张不可变 `FrameRecord`；返回前相机已关闭，内部缓存预算按 1 帧计算 |
-| `session.start_continuous(max_duration=6.0)` | 启动新缓存；达到时限自动请求停止并清理 |
+| `session.capture_one()` | 只复制一张新曝光图像并返回不可变 `FrameRecord`；相机保持启动 |
+| `session.start_continuous(max_duration=6.0)` | 启动新缓存；达到时限自动暂停读取并释放缓存 |
 | `session.get_before(t, timeout=2.0)` | 返回当前会话内严格早于时间戳的最近帧 |
-| `session.stop_continuous()` | 停止、关闭并释放内部缓存，可重复调用 |
-| `session.close()` | 结束整个模块实例；之后不再允许启动 |
+| `session.stop_continuous()` | 暂停读取并释放内部缓存，相机保持启动；可重复调用 |
+| `session.close()` | 真正停止、关闭相机并结束模块；之后不再允许启动 |
 | `flow.set_enabled(False/True)` | 切换流程开关，取消当前延迟任务并停止连续采集 |
 
-这里“单帧”指模块只请求并复制一张图像，不能据此保证传感器启动内部只发生一次曝光。
+这里“单帧”指模块只复制一张图像；恢复读取时可能先读出并丢弃旧曝光请求。相机传感器
+仍连续曝光，不意味着传感器只曝光一次。新一轮首帧要求
+`SensorTimestamp - ExposureTime * 1000`（纳秒）对应的曝光起点不早于该轮激活时间，
+使用与传感器一致的 `CLOCK_BOOTTIME`，避免旧帧混入。
+随后历史帧查询仍使用原始 `SensorTimestamp`，不减曝光时间。
 返回的 `FrameRecord` 自己持有图像，因此后续停止或重新采集不会破坏已返回的图像。
 已经自动停止的缓存不可再查询，GLUE 晚到会明确失败，不会拿上一轮或 INNER 图像替代。
 GLUE 在等待或启动阶段到来时返回 `not_ready`，同时取消该轮延迟启动。重复 INNER 会
@@ -45,12 +54,12 @@ GLUE 图像产生于收到信号之后，不提供“信号前最近帧”保证
 ```python
 from pathlib import Path
 from frame_capture import (
-    CameraSettings, CaptureConfig, OnDemandFrameCapture,
+    CameraSettings, CaptureConfig, KeepAliveFrameCapture,
     TriggerConfig, TriggeredFrameCapture, now_sensor_clock_ns,
 )
 
 settings = CameraSettings.from_json(Path.home() / ".config/tf_inner/camera_settings.json")
-session = OnDemandFrameCapture(CaptureConfig(capacity=30, frame_timeout=0.2), settings)
+session = KeepAliveFrameCapture(CaptureConfig(capacity=30, frame_timeout=0.2), settings)
 flow = TriggeredFrameCapture(session, TriggerConfig(
     enabled=True, start_delay=3.0, max_duration=6.0,
 ))
@@ -67,14 +76,26 @@ def handle_glue(received_timestamp_ns):
 # 不能排队或完成其他检测后才重记信号时间。退出应用时调用 flow.close()。
 ```
 
-等待新有效帧仍为 **200 ms**。如果相机失败，或原生图像读取卡住，看门狗会请求停止并
-暴露错误；停止清理最多等待 3 秒。线程无法强杀卡死的原生驱动，未确认关闭前不允许
-再开启另一个相机实例。清理 API 自身报错时，该模块实例禁止复用；不会自动重连掩盖故障。
+活动读取期间，**连续 200 ms 没有新的有效传感器帧**仍会报错；重复时间戳不算新帧，
+空闲期间不启用这个看门狗。恢复读取时可丢弃仍在传输的旧曝光帧，它们不复制进缓存，
+但递增的新时间戳证明相机仍在出帧。首次初始化和等待新曝光各受 `start_timeout`（默认
+10 秒）约束；连续窗口的 6 秒总时限也始终有效。因此整个 `capture_one()` 调用可能超过
+200 ms，尤其第一次需要初始化相机。
+
+相机失败或原生图像读取卡住时，看门狗暴露错误并请求真正停止、关闭；清理最多等待 3 秒。
+线程无法强杀卡死的原生驱动，未确认关闭前不允许再开启另一个相机实例；不会自动重连
+掩盖故障。`camera_started` 与起停计数可用于判断相机是否仍保持启动。
+
+对比旧行为时，直接将上例类名换为 `OnDemandFrameCapture`：它会在每次单帧和连续窗口
+结束后真正关闭相机，下一轮重新初始化；单帧预算按 1 帧计算。常开类则首次按完整 30 帧
+窗口检查可用内存，不会在后续连续读取时突然改变配置。
 
 ### 独立实机流程测试
 
-2026-10-09：原 58 项回归及新增单帧、定时、并发取消和测试入口检查，共 104 项本地
-测试通过；尚未将该按需流程的硬件温度结果标记为通过。
+2026-10-09：此前每轮关闭相机模式的实机 3 轮测试通过，约 21.92 秒，温度
+49.60–51.25°C，首尾均为 50.70°C。该短测不能代表 10 分钟温升；新的常开模式尚待实机验证。
+新增常开、并发退出和测试入口回归后，共 **137 项本地测试通过**；本地假相机测试不能
+替代真实传感器的延迟和温度测量。
 
 先关闭占用相机的 TF GUI。下面模拟 3 轮 INNER/GLUE；GLUE 暂定在 INNER 单帧返回后
 5 秒发出，仅用于验证接口，不代表已测量的生产信号间隔。每张返回图都核对实际曝光和增益。
@@ -83,19 +104,36 @@ def handle_glue(received_timestamp_ns):
 cd "$HOME/tf-frame-buffer-test" &&
 git pull --ff-only &&
 /usr/bin/python3 tools/test_triggered_capture.py \
-  --cycles 3 --start-delay 3 --glue-delay 5 --max-duration 6 \
-  --report "$HOME/frame-capture-triggered.json" \
-  --log "$HOME/frame-capture-triggered.jsonl"
+  --camera-mode keep-alive --cycles 3 \
+  --report "$HOME/frame-capture-keepalive.json" \
+  --log "$HOME/frame-capture-keepalive.jsonl"
 ```
 
 同一个脚本可用 `--skip-glue --cycles 1` 验证无 GLUE 时自动停止；用 `--single-only`
-验证关闭开关后的两次单帧。默认 30 帧、原始分辨率和 200 ms 等帧超时。
+验证关闭开关后的两次单帧。默认 30 帧、原始分辨率、3 秒延迟、6 秒连续时限和 200 ms 无帧超时。
 如果 5 秒时相机仍未准备好，会如实失败；可调整 `--glue-delay` 测量可用窗口。
 
-观察按需模式温升可将 `--cycles 3` 换成 `--duration 600`。它重复完整流程至少 600 秒，
+观察常开模式温升可将 `--cycles 3` 换成 `--duration 600`。它重复完整流程至少 600 秒，
 最后一轮做完才结束；每轮之间默认空闲 1 秒（`--idle-between-cycles`），需按实测生产节拍
 调整后才能代表真实温升。JSON 报告记录每轮返回图信息、起停状态及处理器温度；JSONL
 逐事件刷新，不保存连续图像。Ctrl+C 和普通故障会保留已完成的记录。
+
+默认测试模式为 `--camera-mode keep-alive`；每轮验证相机仍在运行、累计只启动一次，
+空闲间隔没有增加图像复制计数；最终退出才验证停止和关闭各一次。摘要包含温度范围、
+INNER/GLUE 等待耗时和相机起停次数。用 `--camera-mode close-between` 与不同的报告路径
+可重复此前模式进行比较；两次测试需采用相同节拍、散热条件和接近的初始温度。
+
+只查看可贴回聊天的简短结果：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+r = json.loads((Path.home() / "frame-capture-keepalive.json").read_text())
+for key in ("status", "summary", "errors", "warnings"):
+    print(key, json.dumps(r.get(key), ensure_ascii=False, indent=2))
+PY
+```
 
 ## 使用方式
 

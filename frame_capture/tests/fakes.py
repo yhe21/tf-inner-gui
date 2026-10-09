@@ -75,6 +75,7 @@ class FakeCamera:
         self.controls = None
         self.calls = []
         self.capture_count = 0
+        self.capture_kwargs = []
         self.stop_count = 0
         self.close_count = 0
         self.cancel_count = 0
@@ -105,10 +106,11 @@ class FakeCamera:
         if self.start_error is not None:
             raise self.start_error
 
-    def capture_request(self, wait=False):
+    def capture_request(self, wait=False, flush=None):
         if wait is not False:
             raise AssertionError("capture must use an interruptible asynchronous job")
         self.capture_count += 1
+        self.capture_kwargs.append({"wait": wait, "flush": flush})
         return FakeJob(self)
 
     def cancel_all_and_flush(self):

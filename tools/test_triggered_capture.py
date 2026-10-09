@@ -10,7 +10,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from frame_capture import (  # noqa: E402
-    CameraSettings, CaptureConfig, OnDemandFrameCapture,
+    CameraSettings, CaptureConfig, KeepAliveFrameCapture, OnDemandFrameCapture,
     TriggerConfig, TriggeredFrameCapture, now_sensor_clock_ns,
 )
 from tools.soak_frame_capture import probe_system  # noqa: E402
@@ -41,6 +41,16 @@ def check_settings(frame, settings):
         raise AssertionError(f"Frame colour gains do not match fixed setting: {colours}")
 
 
+def check_keep_alive(state, *, closed=False):
+    """A passing warm test must prove hardware stayed started across pauses."""
+    expected = {"camera_started": not closed, "camera_open_count": 1,
+                "camera_start_count": 1, "camera_stop_count": int(closed),
+                "camera_close_count": int(closed)}
+    actual = {key: state.get(key) for key in expected}
+    if actual != expected:
+        raise AssertionError(f"Keep-alive camera lifecycle mismatch: {actual}; expected {expected}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--settings", type=Path, default=Path.home() / ".config/tf_inner/camera_settings.json")
@@ -54,6 +64,8 @@ def main(argv=None):
     parser.add_argument("--frame-timeout", type=positive, default=0.2)
     parser.add_argument("--query-timeout", type=positive, default=2.0)
     parser.add_argument("--capacity", type=int, default=30)
+    parser.add_argument("--camera-mode", choices=("keep-alive", "close-between"), default="keep-alive",
+                        help="Keep hardware started while idle (default), or close after each capture window")
     parser.add_argument("--single-only", action="store_true", help="Disable delayed buffering; both events capture one new frame")
     parser.add_argument("--skip-glue", action="store_true", help="Do not send GLUE; verify the automatic duration stop")
     parser.add_argument("--report", type=Path, default=Path.home() / "frame-capture-triggered.json")
@@ -101,7 +113,9 @@ def main(argv=None):
 
             try:
                 settings = CameraSettings.from_json(args.settings)
-                session = OnDemandFrameCapture(
+                session_type = (KeepAliveFrameCapture if args.camera_mode == "keep-alive"
+                                else OnDemandFrameCapture)
+                session = session_type(
                     CaptureConfig(capacity=args.capacity, frame_timeout=args.frame_timeout), settings)
                 workflow = TriggeredFrameCapture(session, TriggerConfig(
                     enabled=not args.single_only, start_delay=args.start_delay,
@@ -123,6 +137,8 @@ def main(argv=None):
                     del inner
                     emit("inner_frame", **cycle["inner"])
                     cycle["after_inner"] = workflow.stats()
+                    if args.camera_mode == "keep-alive":
+                        check_keep_alive(cycle["after_inner"]["session"])
                     if args.skip_glue:
                         # Include bounded startup and cleanup allowance, but
                         # only pass when the module stopped itself normally.
@@ -135,7 +151,7 @@ def main(argv=None):
                         else:
                             raise TimeoutError("Continuous capture did not automatically stop")
                         if session.stats()["state"] != "idle":
-                            raise AssertionError("Automatic stop did not release camera ownership")
+                            raise AssertionError("Automatic stop did not finish pausing application capture")
                         cycle["automatic_stop"] = True
                     else:
                         wait_until(inner_finished + args.glue_delay)
@@ -154,10 +170,18 @@ def main(argv=None):
                     if (cycle["after_cycle"].get("error") or stopped.get("error") or
                             stopped.get("cleanup_error") or stopped["state"] != "idle"):
                         raise AssertionError(f"Camera did not finish this cycle cleanly: {cycle['after_cycle']}")
+                    if args.camera_mode == "keep-alive":
+                        check_keep_alive(stopped)
+                    cycle["passed"] = True
                     emit("cycle_complete", cycle=cycle_index, state=cycle["after_cycle"])
                     sample()
                     if args.duration is not None or cycle_index < args.cycles:
                         wait_until(time.monotonic() + args.idle_between_cycles)
+                        if args.camera_mode == "keep-alive":
+                            after_idle = session.stats()
+                            check_keep_alive(after_idle)
+                            if after_idle.get("copied_frames_total") != stopped.get("copied_frames_total"):
+                                raise AssertionError("Images were copied during the idle interval")
                 report["status"] = "passed"
             except KeyboardInterrupt:
                 report["status"] = "interrupted"
@@ -180,17 +204,34 @@ def main(argv=None):
                         report["errors"].append(f"Final camera status is not clean: {final}")
                         if report["status"] != "interrupted":
                             report["status"] = "failed"
+                    if args.camera_mode == "keep-alive" and report["status"] == "passed":
+                        try:
+                            check_keep_alive(stopped, closed=True)
+                        except AssertionError as error:
+                            report["errors"].append(str(error))
+                            report["status"] = "failed"
                 temps = [row["temperature_c"] for row in report["samples"] if row["temperature_c"] is not None]
                 if not temps:
                     report["warnings"].append("Processor temperature unavailable; thermal benefit is unverified")
                 report["summary"] = {
+                    "camera_mode": args.camera_mode,
                     "elapsed_seconds": time.monotonic() - started,
-                    "cycles_completed": sum("after_cycle" in row for row in report["cycles"]),
+                    "cycles_completed": sum(row.get("passed", False) for row in report["cycles"]),
                     "temperature_min_c": min(temps) if temps else None,
                     "temperature_max_c": max(temps) if temps else None,
                     "temperature_first_c": temps[0] if temps else None,
                     "temperature_last_c": temps[-1] if temps else None,
                 }
+                for phase, field in (("inner", "capture_wait_ms"), ("glue", "lookup_wait_ms")):
+                    values = [row[phase][field] for row in report["cycles"] if phase in row]
+                    report["summary"][f"{phase}_wait_mean_ms"] = sum(values) / len(values) if values else None
+                    report["summary"][f"{phase}_wait_max_ms"] = max(values) if values else None
+                if args.camera_mode == "keep-alive" and "final_statistics" in report:
+                    final_session = report["final_statistics"]["session"]
+                    report["summary"]["camera_lifecycle"] = {
+                        key: final_session.get(key) for key in (
+                            "camera_open_count", "camera_start_count", "camera_stop_count",
+                            "camera_close_count", "copied_frames_total")}
                 emit("finished", status=report["status"], summary=report["summary"],
                      errors=report["errors"], warnings=report["warnings"])
     except Exception as error:

@@ -19,7 +19,8 @@ _SPEC.loader.exec_module(runner)
 
 
 class SimulatedSession:
-    def __init__(self, clock, *, cleanup_delay=0.0, never_finish=False):
+    def __init__(self, clock, *, cleanup_delay=0.0, never_finish=False,
+                 warm=False, paused_camera=False, final_camera_running=False):
         self.clock = clock
         self.cleanup_delay = cleanup_delay
         self.never_finish = never_finish
@@ -30,6 +31,9 @@ class SimulatedSession:
         self.max_duration = 0.1
         self.observed = []
         self.error = None
+        self.warm = warm
+        self.paused_camera = paused_camera
+        self.final_camera_running = final_camera_running
 
     def stats(self):
         elapsed = (0.0 if self.inner_finished is None else
@@ -48,6 +52,18 @@ class SimulatedSession:
             result["last_capture"] = {"stop_reason": "duration_limit"}
         elif elapsed >= self.start_delay:
             result["state"] = "running"
+        if self.warm:
+            opened = int(self.inner_finished is not None)
+            result.update(camera_started=bool(opened and not self.closed),
+                          camera_open_count=opened, camera_start_count=opened,
+                          camera_stop_count=int(self.closed), camera_close_count=int(self.closed),
+                          copied_frames_total=opened + int(self.completed))
+            if self.paused_camera and self.completed:
+                result["camera_started"] = False
+                result["camera_stop_count"] = 1
+            if self.final_camera_running and self.closed:
+                result["camera_started"] = True
+                result["camera_stop_count"] = result["camera_close_count"] = 0
         self.observed.append(dict(result))
         return result
 
@@ -69,6 +85,7 @@ class SimulatedWorkflow:
         return FrameRecord(0, timestamp, request.image, request.metadata)
 
     def on_inner(self):
+        self.session.completed = False
         self.session.inner_finished = self.session.clock.monotonic()
         return self.make_frame(self.session.clock.signal(),
                                50000 if self.bad_exposure else 5000)
@@ -97,10 +114,12 @@ class SimulatedWorkflow:
 class TriggeredRunnerTests(unittest.TestCase):
     def run_simulation(self, *, skip_glue=False, cleanup_delay=0, never_finish=False,
                        bad_exposure=False, cleanup_failure=False,
-                       late_capture_failure=False, final_capture_failure=False, temperature=50):
+                       late_capture_failure=False, final_capture_failure=False, temperature=50,
+                       warm=False, paused_camera=False, final_camera_running=False, cycles=1):
         clock = SimulatedClock()
         session = SimulatedSession(clock, cleanup_delay=cleanup_delay,
-                                   never_finish=never_finish)
+                                   never_finish=never_finish, warm=warm, paused_camera=paused_camera,
+                                   final_camera_running=final_camera_running)
         workflow = SimulatedWorkflow(
             session, bad_exposure=bad_exposure, cleanup_failure=cleanup_failure,
             late_capture_failure=late_capture_failure,
@@ -109,9 +128,11 @@ class TriggeredRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "report.json"
             log_path = Path(directory) / "events.jsonl"
-            arguments = ["--cycles", "1", "--start-delay", "0.1", "--max-duration", "0.1",
+            arguments = ["--cycles", str(cycles), "--start-delay", "0.1", "--max-duration", "0.1",
                          "--glue-delay", "0.15", "--report", str(report_path),
                          "--log", str(log_path)]
+            if not warm:
+                arguments.extend(("--camera-mode", "close-between"))
             if skip_glue:
                 arguments.append("--skip-glue")
             with (patch.object(runner, "time", SimpleNamespace(
@@ -119,10 +140,12 @@ class TriggeredRunnerTests(unittest.TestCase):
                   patch.object(runner, "now_sensor_clock_ns", clock.signal),
                   patch.object(runner.CameraSettings, "from_json", return_value=settings),
                   patch.object(runner, "OnDemandFrameCapture", return_value=session),
+                  patch.object(runner, "KeepAliveFrameCapture", return_value=session) as warm_factory,
                   patch.object(runner, "TriggeredFrameCapture", return_value=workflow),
                   patch.object(runner, "probe_system", return_value={"temperature_c": temperature}),
                   patch("builtins.print")):
                 code = runner.main(arguments)
+                self.assertEqual(warm_factory.call_count, int(warm))
             report = json.loads(report_path.read_text(encoding="utf-8"))
             events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
         return code, report, events, session, workflow
@@ -191,6 +214,36 @@ class TriggeredRunnerTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(report["status"], "failed")
         self.assertTrue(any("final acquisition failure" in error for error in report["errors"]))
+
+    def test_default_keeps_camera_started_over_multiple_cycles_and_reports_counts(self):
+        code, report, _, _, _ = self.run_simulation(warm=True, cycles=2)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["summary"]["camera_mode"], "keep-alive")
+        self.assertEqual(report["summary"]["cycles_completed"], 2)
+        lifecycle = report["summary"]["camera_lifecycle"]
+        for key in ("camera_open_count", "camera_start_count", "camera_stop_count", "camera_close_count"):
+            self.assertEqual(lifecycle[key], 1)
+        self.assertIn("inner_wait_mean_ms", report["summary"])
+        self.assertIn("glue_wait_max_ms", report["summary"])
+        for cycle in report["cycles"]:
+            self.assertTrue(cycle["after_cycle"]["session"]["camera_started"])
+
+    def test_default_auto_pause_keeps_hardware_started(self):
+        code, report, _, _, _ = self.run_simulation(warm=True, skip_glue=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(report["cycles"][0]["automatic_stop"])
+        self.assertTrue(report["cycles"][0]["after_cycle"]["session"]["camera_started"])
+
+    def test_accidentally_stopping_camera_at_pause_fails_warm_test(self):
+        code, report, _, _, _ = self.run_simulation(warm=True, paused_camera=True)
+        self.assertEqual(code, 1)
+        self.assertTrue(any("lifecycle mismatch" in error for error in report["errors"]))
+        self.assertEqual(report["summary"]["cycles_completed"], 0)
+
+    def test_final_close_must_really_stop_and_close_warm_camera(self):
+        code, report, _, _, _ = self.run_simulation(warm=True, final_camera_running=True)
+        self.assertEqual(code, 1)
+        self.assertTrue(any("lifecycle mismatch" in error for error in report["errors"]))
 
 
 if __name__ == "__main__":
