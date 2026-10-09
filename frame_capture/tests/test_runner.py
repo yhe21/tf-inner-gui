@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -52,6 +52,24 @@ def synthetic_args():
 
 
 class HardwareRunnerValidationTests(unittest.TestCase):
+    def test_cli_defaults_preserve_native_resolution_and_automatic_memory_budget(self):
+        settings = CameraSettings(66657, 4.87619, (3.04152, 1.50356))
+        camera = MagicMock()
+        camera.__enter__.return_value = camera
+        camera.stats.return_value = {"state": "stopped", "error": None}
+        successful_checks = {"status": "passed", "hardware_test": True, "checks": {}}
+        with patch.object(runner.CameraSettings, "from_json", return_value=settings), \
+                patch.object(runner, "Picamera2FrameCapture", return_value=camera) as factory, \
+                patch.object(runner, "self_test", return_value=successful_checks), \
+                patch.object(runner, "emit"):
+            exit_code = runner.main(["--self-test"])
+        self.assertEqual(exit_code, 0)
+        config = factory.call_args.args[0]
+        self.assertIsNone(config.width)
+        self.assertIsNone(config.height)
+        self.assertIsNone(config.memory_budget_mb)
+        self.assertEqual(config.capacity, 200)
+
     def test_numeric_but_clipped_exposure_cannot_pass_self_test(self):
         camera = SyntheticHistory(exposure_us=33333)
         with patch.object(runner, "now_sensor_clock_ns", return_value=camera.signal_ns), \

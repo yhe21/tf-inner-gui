@@ -59,7 +59,7 @@ class FakeJob:
 
 
 class FakeCamera:
-    def __init__(self, *, framesize=None, start_error=None):
+    def __init__(self, *, framesize=None, start_error=None, sensor_resolution=(8, 6)):
         self.requests = queue.Queue()
         self.cancelled = threading.Event()
         self.camera_controls = {
@@ -68,6 +68,7 @@ class FakeCamera:
             "ColourGains": ((0.0, 0.0), (32.0, 32.0), (1.0, 1.0)),
             "FrameDurationLimits": (1000, 1000000, 33333),
         }
+        self.sensor_resolution = sensor_resolution
         self.framesize = framesize
         self.start_error = start_error
         self.config = None
@@ -81,11 +82,12 @@ class FakeCamera:
     def create_video_configuration(self, **kwargs):
         self.calls.append("create_video_configuration")
         main = dict(kwargs.get("main", {}))
-        main.setdefault("size", (8, 6))
+        main.setdefault("size", self.sensor_resolution)
         main.setdefault("format", "RGB888")
         width, height = main["size"]
         main["framesize"] = self.framesize or width * height * 3
-        return {**kwargs, "main": main}
+        sensor = dict(kwargs.get("sensor") or {"output_size": main["size"]})
+        return {**kwargs, "main": main, "sensor": sensor}
 
     def configure(self, config):
         self.calls.append("configure")

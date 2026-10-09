@@ -210,12 +210,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--settings", type=Path,
                         default=Path.home() / ".config/tf_inner/camera_settings.json")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--width", type=int, default=None,
+                        help="Explicit output width; omit both dimensions for native sensor resolution")
+    parser.add_argument("--height", type=int, default=None,
+                        help="Explicit output height; must be supplied together with --width")
     parser.add_argument("--format", dest="pixel_format", choices=("RGB888", "YUV420"), default="RGB888")
     parser.add_argument("--capacity", type=int, default=200)
     parser.add_argument("--fps", type=float, default=None)
-    parser.add_argument("--memory-budget-mb", type=float, default=1024)
+    parser.add_argument("--memory-budget-mb", type=float, default=None,
+                        help="Optional extra MiB limit; available RAM is always checked")
     parser.add_argument("--camera-num", type=int, default=0)
     parser.add_argument("--query-timeout", type=float, default=2)
     parser.add_argument("--fill-timeout", type=float, default=120)
@@ -225,6 +228,8 @@ def main(argv=None):
     parser.add_argument("--save-dir", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
+    if (args.width is None) != (args.height is None):
+        parser.error("Supply both --width and --height, or omit both for native resolution")
     if args.capacity < 4 or args.signals < 1:
         parser.error("The test runner needs capacity >= 4 and signals >= 1")
     if args.query_timeout <= 0 or args.fill_timeout <= 0:

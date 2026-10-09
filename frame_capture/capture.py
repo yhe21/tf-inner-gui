@@ -72,31 +72,40 @@ class CameraSettings:
 @dataclass(frozen=True)
 class CaptureConfig:
     capacity: int = 200
-    width: int = 1280
-    height: int = 720
+    width: int | None = None
+    height: int | None = None
     pixel_format: str = "RGB888"
     fps: float | None = None
-    memory_budget_mb: float = 1024
+    memory_budget_mb: float | None = None
     camera_num: int = 0
     camera_buffer_count: int = 4
     frame_timeout: float = 3.0
     start_timeout: float = 10.0
 
     def __post_init__(self) -> None:
-        for name in ("capacity", "width", "height", "camera_buffer_count"):
+        for name in ("capacity", "camera_buffer_count"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if (self.width is None) != (self.height is None):
+            raise ValueError("width and height must both be None for native resolution, or both be positive integers")
+        if self.width is not None:
+            for name in ("width", "height"):
+                value = getattr(self, name)
+                if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer")
         if self.camera_buffer_count < 2:
             raise ValueError("camera_buffer_count must be at least 2")
         if isinstance(self.camera_num, bool) or not isinstance(self.camera_num, Integral) or self.camera_num < 0:
             raise ValueError("camera_num must be a non-negative integer")
         if self.pixel_format not in {"RGB888", "BGR888", "YUV420"}:
             raise ValueError("pixel_format must be RGB888, BGR888 or YUV420")
-        if self.pixel_format == "YUV420" and (self.width % 2 or self.height % 2):
+        if self.pixel_format == "YUV420" and self.width is not None and (self.width % 2 or self.height % 2):
             raise ValueError("YUV420 dimensions must be even")
-        for name in ("memory_budget_mb", "frame_timeout", "start_timeout"):
+        for name in ("frame_timeout", "start_timeout"):
             object.__setattr__(self, name, _positive_number(getattr(self, name), name))
+        if self.memory_budget_mb is not None:
+            object.__setattr__(self, "memory_budget_mb", _positive_number(self.memory_budget_mb, "memory_budget_mb"))
         if self.fps is not None:
             object.__setattr__(self, "fps", _positive_number(self.fps, "fps"))
 
@@ -149,6 +158,9 @@ class Picamera2FrameCapture:
         self._cleanup_error: str | None = None
         self._duplicates_dropped = 0
         self._negotiated: dict[str, Any] | None = None
+        self._requested: dict[str, Any] | None = None
+        self._native_resolution: tuple[int, int] | None = None
+        self._effective_memory_budget_bytes: int | None = None
         self._controls: dict[str, Any] | None = None
         self._estimated_bytes = 0
         self._available_bytes: int | None = None
@@ -226,9 +238,12 @@ class Picamera2FrameCapture:
                 "error": self._error,
                 "cleanup_error": self._cleanup_error,
                 "duplicates_dropped": self._duplicates_dropped,
+                "native_sensor_resolution": self._native_resolution,
+                "requested_configuration": deepcopy(self._requested),
                 "negotiated_configuration": deepcopy(self._negotiated),
                 "applied_controls": deepcopy(self._controls),
                 "estimated_bytes": self._estimated_bytes,
+                "effective_memory_budget_bytes": self._effective_memory_budget_bytes,
                 "available_bytes_at_start": self._available_bytes,
                 "timestamp_clock": "CLOCK_BOOTTIME",
                 "timestamp_basis": "raw SensorTimestamp",
@@ -261,15 +276,59 @@ class Picamera2FrameCapture:
         return Picamera2(self.config.camera_num)
 
     def _prepare(self, camera: Any) -> None:
-        configuration = camera.create_video_configuration(
-            main={"size": (self.config.width, self.config.height), "format": self.config.pixel_format},
-            raw=None, buffer_count=self.config.camera_buffer_count, queue=False,
-        )
+        native_requested = self.config.width is None
+        native = getattr(camera, "sensor_resolution", None)
+        if native is not None:
+            native = tuple(native)
+            if len(native) != 2 or any(
+                isinstance(value, bool) or not isinstance(value, Integral) or value <= 0
+                for value in native
+            ):
+                raise ValueError("Camera returned an invalid native sensor resolution")
+            self._native_resolution = tuple(int(value) for value in native)
+        if native_requested:
+            if self._native_resolution is None:
+                raise ValueError("Camera did not report its native sensor resolution")
+            requested_size = self._native_resolution
+        else:
+            requested_size = (self.config.width, self.config.height)
+        if self.config.pixel_format == "YUV420" and any(value % 2 for value in requested_size):
+            raise ValueError("YUV420 dimensions must be even, including the resolved native resolution")
+        self._requested = {
+            "resolution_mode": "native" if native_requested else "explicit",
+            "main": {"size": requested_size, "format": self.config.pixel_format},
+            "sensor": {"output_size": self._native_resolution} if native_requested else None,
+        }
+        configuration_options = {
+            "main": dict(self._requested["main"]),
+            "raw": None,
+            "buffer_count": self.config.camera_buffer_count,
+            "queue": False,
+        }
+        if native_requested:
+            # Native output alone could otherwise be upscaled from a binned
+            # sensor mode. Require the sensor readout itself to be native too.
+            configuration_options["sensor"] = dict(self._requested["sensor"])
+        configuration = camera.create_video_configuration(**configuration_options)
         camera.configure(configuration)
         actual = camera.camera_configuration()
         main = actual["main"]
-        if tuple(main["size"]) != (self.config.width, self.config.height):
-            raise ValueError(f"Camera changed requested dimensions to {main['size']}; choose them explicitly")
+        sensor = actual.get("sensor")
+        self._negotiated = {
+            "main": dict(main),
+            "sensor": dict(sensor) if sensor else None,
+            "raw": dict(actual["raw"]) if actual.get("raw") else None,
+            "buffer_count": self.config.camera_buffer_count,
+            "queue": False,
+        }
+        if tuple(main["size"]) != requested_size:
+            raise ValueError(f"Camera changed requested dimensions {requested_size} to {main['size']}; "
+                             "automatic resolution changes are not permitted")
+        if native_requested and (
+            not sensor or tuple(sensor.get("output_size", ())) != self._native_resolution
+        ):
+            raise ValueError(f"Camera did not provide native sensor readout {self._native_resolution}; "
+                             f"negotiated sensor configuration: {sensor}")
         if main["format"] != self.config.pixel_format:
             raise ValueError(f"Camera changed requested pixel format to {main['format']}")
         framesize = int(main["framesize"])
@@ -282,16 +341,18 @@ class Picamera2FrameCapture:
         estimated += streams_bytes * self.config.camera_buffer_count + 2 * 1024 * 1024
         available = self._memory_probe()
         self._estimated_bytes, self._available_bytes = estimated, available
-        self._negotiated = {
-            "main": dict(main),
-            "raw": dict(actual["raw"]) if actual.get("raw") else None,
-            "buffer_count": self.config.camera_buffer_count,
-            "queue": False,
-        }
-        if estimated > self.config.memory_budget_mb * 1024 * 1024:
+        headroom = 128 * 1024 * 1024
+        explicit_budget = (None if self.config.memory_budget_mb is None
+                           else int(self.config.memory_budget_mb * 1024 * 1024))
+        if available is None and explicit_budget is None:
+            raise MemoryError("Available RAM could not be determined; provide an explicit memory_budget_mb")
+        budgets = [value for value in (
+            explicit_budget, None if available is None else max(0, available - headroom)
+        ) if value is not None]
+        self._effective_memory_budget_bytes = min(budgets)
+        if explicit_budget is not None and estimated > explicit_budget:
             raise MemoryError(f"Capture needs approximately {estimated / 1024**2:.1f} MiB; "
                               f"budget is {self.config.memory_budget_mb} MiB")
-        headroom = 128 * 1024 * 1024
         if available is not None and estimated + headroom > available:
             raise MemoryError(f"Capture needs {estimated / 1024**2:.1f} MiB plus 128 MiB headroom; "
                               f"only {available / 1024**2:.1f} MiB available")
