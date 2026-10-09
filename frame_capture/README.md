@@ -155,3 +155,52 @@ python3 tools/test_frame_capture.py --self-test \
 
 参考：[Picamera2 手册](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf)，
 [libcamera SensorTimestamp 定义](https://libcamera.org/api-html/namespacelibcamera_1_1controls.html)。
+
+## 超时与故障处理
+
+| 阶段 | 默认限时 | 超时后的行为 |
+| --- | --- | --- |
+| 启动相机 | 10 秒 | 抛出 `FrameUnavailable("timeout", ...)`，请求停止并清理 |
+| 等待相机新请求 | 连续 3 秒没有进展 | 采集状态变为 `failed`，记录错误，尝试释放请求并关闭相机 |
+| 按信号查询 | 模块默认 1 秒；测试脚本默认 2 秒 | 抛出 `FrameUnavailable("timeout", ...)`，不返回未经确认的旧帧 |
+| 停止和清理 | 3 秒 | 报告清理超时，不声称相机已释放 |
+
+帧时间戳倒退、长时间重复同一帧和图像读取错误也会使采集失败；查询方会收到
+`capture_failed`。查询超时本身不停止后台采集，调用方可以处理错误后继续发新的信号。
+当前模块**不自动重连或重新启动相机**。采集对象只能启动一次；如果底层驱动的原生调用
+卡死，线程内超时不能强制中断该调用，需要由外部进程管理来完成强制恢复。
+
+## 连续 10 分钟温度测试
+
+该入口新增 20 项模拟回归测试，与原模块合计 58 项本地测试通过（2026-10-09）。
+模拟时钟可验证 600 秒调度和超时处理；真实温度与长时间稳定性仍须运行下面的实机测试。
+
+先退出占用相机的 TF GUI，然后在独立测试目录更新分支并运行：
+
+```bash
+cd "$HOME/tf-frame-buffer-test" &&
+git pull --ff-only &&
+/usr/bin/python3 tools/soak_frame_capture.py \
+  --duration 600 \
+  --capacity 30 \
+  --settings "$HOME/.config/tf_inner/camera_settings.json" \
+  --sample-interval 5 \
+  --query-interval 1 \
+  --report "$HOME/frame-capture-10min.json" \
+  --log "$HOME/frame-capture-10min.jsonl"
+```
+
+保持原生分辨率、RGB888 和固定曝光，填满缓存后持续运行 600 秒，启动和关闭另计。
+每秒发送一个本机时间信号测试选帧，每 5 秒记录处理器温度、进程 RSS、帧率和降频状态。
+这里只读取树莓派处理器温度，不代表摄像头传感器温度；不保存连续图像到磁盘。
+JSONL 日志逐条写入并刷新，JSON 报告汇总温度和查询耗时；普通异常及 Ctrl+C 都会尝试
+写出已有结果。强制断电或强制终止进程时不能保证最终报告完成，可检查已有 JSONL 日志。
+
+单次查询超时记入计数并继续观察，但最终测试不能标记为通过；采集错误或持续无帧则终止
+测试并保留部分记录。开始前记录 `vcgencmd get_throttled` 基线，将当前告警、开机以来的
+历史告警和测试中新出现的历史位分开报告；已有历史位无法用于判断该故障在本次是否重现。
+温度读取失败会明确记录，全部温度样本缺失时不能宣称温度测试通过。
+`passed` 表示采集、查询和测试完成检查通过；供电或降频告警会单独写入 `warnings`，
+因此判断散热表现还需要查看温度曲线及告警，不能仅看 `status`。
+
+降频位参考：[Raspberry Pi 官方 `get_throttled` 定义](https://www.raspberrypi.com/documentation/computers/os.html#get_throttled)。
