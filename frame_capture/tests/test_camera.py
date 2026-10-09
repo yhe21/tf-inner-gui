@@ -28,7 +28,7 @@ def wait_until(predicate, timeout=2.0):
 class CameraCaptureTests(unittest.TestCase):
     def make_capture(self, camera=None, settings=None, **config_overrides):
         camera = camera or FakeCamera()
-        values = dict(width=8, height=6, capacity=200, memory_budget_mb=8,
+        values = dict(width=8, height=6, capacity=30, memory_budget_mb=8,
                       frame_timeout=2.0)
         values.update(config_overrides)
         config = CaptureConfig(**values)
@@ -229,7 +229,7 @@ class CameraCleanupTests(unittest.TestCase):
     @staticmethod
     def capture_for(camera):
         return Picamera2FrameCapture(
-            CaptureConfig(width=8, height=6, capacity=200, memory_budget_mb=8),
+            CaptureConfig(width=8, height=6, capacity=30, memory_budget_mb=8),
             CameraSettings(5000, 2.0, (1.5, 1.6)),
             camera_factory=lambda: camera,
             available_memory_bytes=lambda: 2**30,
@@ -265,7 +265,7 @@ class CameraCleanupTests(unittest.TestCase):
     def test_available_memory_headroom_is_checked_before_capture_starts(self):
         camera = FakeCamera()
         capture = Picamera2FrameCapture(
-            CaptureConfig(width=8, height=6, capacity=200, memory_budget_mb=8),
+            CaptureConfig(width=8, height=6, capacity=30, memory_budget_mb=8),
             CameraSettings(5000, 2.0, (1.5, 1.6)),
             camera_factory=lambda: camera,
             available_memory_bytes=lambda: 1024 * 1024,

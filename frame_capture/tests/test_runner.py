@@ -68,7 +68,7 @@ class HardwareRunnerValidationTests(unittest.TestCase):
         self.assertIsNone(config.width)
         self.assertIsNone(config.height)
         self.assertIsNone(config.memory_budget_mb)
-        self.assertEqual(config.capacity, 200)
+        self.assertEqual(config.capacity, 30)
 
     def test_numeric_but_clipped_exposure_cannot_pass_self_test(self):
         camera = SyntheticHistory(exposure_us=33333)

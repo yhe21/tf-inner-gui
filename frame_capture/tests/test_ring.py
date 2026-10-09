@@ -20,19 +20,19 @@ def record(sequence, timestamp_ns=None):
 
 
 class FrameRingBufferTests(unittest.TestCase):
-    def test_default_ring_retains_exactly_latest_200_after_repeated_wraps(self):
+    def test_default_ring_retains_exactly_latest_30_after_repeated_wraps(self):
         ring = FrameRingBuffer()
         for sequence in range(1, 602):
             ring.append(record(sequence))
 
         frames = ring.snapshot()
         self.assertIsInstance(frames, tuple)
-        self.assertEqual(len(frames), 200)
-        self.assertEqual([frame.sequence for frame in frames], list(range(402, 602)))
+        self.assertEqual(len(frames), 30)
+        self.assertEqual([frame.sequence for frame in frames], list(range(572, 602)))
         self.assertEqual(ring.get_before(6020).sequence, 601)
-        self.assertEqual(ring.get_before(4030).sequence, 402)
+        self.assertEqual(ring.get_before(5730).sequence, 572)
         with self.assertRaises(FrameUnavailable):
-            ring.get_before(4020)
+            ring.get_before(5720)
 
     def test_matching_is_strictly_earlier_including_equal_timestamp(self):
         ring = FrameRingBuffer(capacity=4)
@@ -82,7 +82,7 @@ class FrameRingBufferTests(unittest.TestCase):
         self.assertNotIn(1, [item.sequence for item in ring.snapshot()])
 
     def test_parallel_readers_observe_coherent_ordered_snapshots(self):
-        ring = FrameRingBuffer(capacity=200)
+        ring = FrameRingBuffer(capacity=30)
         ring.append(record(1))
         start = threading.Barrier(5)
         finished = threading.Event()
@@ -101,7 +101,7 @@ class FrameRingBufferTests(unittest.TestCase):
             while not finished.is_set() or checks < 30:
                 snapshot = ring.snapshot()
                 timestamps = [frame.sensor_timestamp_ns for frame in snapshot]
-                self.assertLessEqual(len(snapshot), 200)
+                self.assertLessEqual(len(snapshot), 30)
                 self.assertTrue(snapshot)
                 self.assertEqual(timestamps, sorted(set(timestamps)))
                 for frame in snapshot:
@@ -116,7 +116,7 @@ class FrameRingBufferTests(unittest.TestCase):
             futures = [pool.submit(writer)] + [pool.submit(reader) for _ in range(4)]
             for future in futures:
                 future.result(timeout=10)
-        self.assertEqual(len(ring.snapshot()), 200)
+        self.assertEqual(len(ring.snapshot()), 30)
         self.assertEqual(ring.snapshot()[-1].sequence, 1501)
 
 

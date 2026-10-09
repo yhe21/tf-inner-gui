@@ -68,7 +68,7 @@ class FrameRecord:
 class FrameRingBuffer:
     """Retains at most capacity frames. Frame timestamps must strictly increase."""
 
-    def __init__(self, capacity: int = 200) -> None:
+    def __init__(self, capacity: int = 30) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, Integral) or capacity < 1:
             raise ValueError("capacity must be a positive integer")
         self.capacity = int(capacity)

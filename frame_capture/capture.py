@@ -71,7 +71,7 @@ class CameraSettings:
 
 @dataclass(frozen=True)
 class CaptureConfig:
-    capacity: int = 200
+    capacity: int = 30
     width: int | None = None
     height: int | None = None
     pixel_format: str = "RGB888"

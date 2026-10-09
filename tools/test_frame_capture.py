@@ -215,7 +215,7 @@ def main(argv=None):
     parser.add_argument("--height", type=int, default=None,
                         help="Explicit output height; must be supplied together with --width")
     parser.add_argument("--format", dest="pixel_format", choices=("RGB888", "YUV420"), default="RGB888")
-    parser.add_argument("--capacity", type=int, default=200)
+    parser.add_argument("--capacity", type=int, default=30)
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--memory-budget-mb", type=float, default=None,
                         help="Optional extra MiB limit; available RAM is always checked")
