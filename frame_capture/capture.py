@@ -144,6 +144,9 @@ class Picamera2FrameCapture:
         *,
         camera_factory: Callable[[], Any] | None = None,
         available_memory_bytes: Callable[[], int | None] | None = None,
+        _frame_limit: int | None = None,
+        _max_duration: float | None = None,
+        _watch_limits: bool = False,
     ) -> None:
         self.config = config
         self.settings = settings
@@ -164,6 +167,18 @@ class Picamera2FrameCapture:
         self._controls: dict[str, Any] | None = None
         self._estimated_bytes = 0
         self._available_bytes: int | None = None
+        # Private limits are used by the reusable on-demand session. The public
+        # continuous service retains its original single-use behaviour.
+        self._frame_limit = _frame_limit
+        self._max_duration = _max_duration
+        self._watch_limits = _watch_limits
+        self._started = threading.Event()
+        self._finished = threading.Event()
+        self._started_at: float | None = None
+        self._last_progress_at: float | None = None
+        self._stop_requested_at: float | None = None
+        self._stop_reason: str | None = None
+        self._external_error: str | None = None
 
     def start(self) -> "Picamera2FrameCapture":
         deadline = time.monotonic() + self.config.start_timeout
@@ -176,24 +191,37 @@ class Picamera2FrameCapture:
             while self._state == "starting":
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._stop.set()
-                    self._state = "stopping"
-                    self._condition.notify_all()
+                    self._request_stop("startup_timeout")
                     raise FrameUnavailable("timeout", "Camera startup timed out; stop() must finish cleanup")
                 self._condition.wait(remaining)
             if self._state != "running":
+                # One queued frame may be copied and the device closed before
+                # this starter thread wakes. That is a successful single shot.
+                if ((self._frame_limit is not None or self._max_duration is not None)
+                        and self._started.is_set()
+                        and self._error is None and self._cleanup_error is None
+                        and self._stop_reason in {"single_complete", "duration_limit"}):
+                    return self
                 raise FrameUnavailable("capture_failed", self._error or f"Camera state: {self._state}")
         return self
 
-    def stop(self, timeout: float = 3.0) -> None:
-        _positive_number(timeout, "timeout")
-        self._stop.set()
+    def _request_stop(self, reason: str = "explicit_stop") -> None:
+        """Request worker-owned cleanup without calling a native API here."""
         with self._condition:
+            if not self._stop.is_set():
+                self._stop_reason = reason
+                self._stop_requested_at = time.monotonic()
+                self._stop.set()
             if self._state == "new":
                 self._state = "stopped"
+                self._finished.set()
             elif self._state in {"starting", "running"}:
                 self._state = "stopping"
             self._condition.notify_all()
+
+    def stop(self, timeout: float = 3.0) -> None:
+        _positive_number(timeout, "timeout")
+        self._request_stop()
         if self._thread is not None:
             self._thread.join(timeout)
             if self._thread.is_alive():
@@ -247,6 +275,11 @@ class Picamera2FrameCapture:
                 "available_bytes_at_start": self._available_bytes,
                 "timestamp_clock": "CLOCK_BOOTTIME",
                 "timestamp_basis": "raw SensorTimestamp",
+                "stop_reason": self._stop_reason,
+                "started_monotonic": self._started_at,
+                "stop_requested_monotonic": self._stop_requested_at,
+                "max_duration_seconds": self._max_duration,
+                "worker_alive": self._thread is not None and self._thread.is_alive(),
             }
 
     def __enter__(self) -> "Picamera2FrameCapture":
@@ -412,10 +445,15 @@ class Picamera2FrameCapture:
                 return
             camera.start()
             with self._condition:
+                self._started_at = time.monotonic()
+                self._last_progress_at = self._started_at
+                self._started.set()
                 if self._stop.is_set():
                     return
                 self._state = "running"
                 self._condition.notify_all()
+            if self._watch_limits:
+                threading.Thread(target=self._watchdog, name="frame-capture-limits", daemon=True).start()
             pending = camera.capture_request(wait=False)
             last_progress = time.monotonic()
             sequence = 0
@@ -424,13 +462,16 @@ class Picamera2FrameCapture:
                 try:
                     request = pending.get_result(timeout=0.1)
                 except JobTimeout:
+                    if self._stop.is_set():
+                        break
                     if time.monotonic() - last_progress > self.config.frame_timeout:
                         raise RuntimeError("Camera frame acquisition timed out")
                     continue
                 pending = None
                 try:
                     # Keep one acquisition queued while the current image is copied.
-                    if not self._stop.is_set():
+                    if (not self._stop.is_set()
+                            and (self._frame_limit is None or sequence + 1 < self._frame_limit)):
                         pending = camera.capture_request(wait=False)
                     metadata = request.get_metadata()
                     timestamp = _nanoseconds(metadata["SensorTimestamp"])
@@ -449,18 +490,25 @@ class Picamera2FrameCapture:
                 finally:
                     request.release()
                 with self._condition:
+                    if self._stop.is_set():
+                        break
                     self.buffer.append(record)
+                    self._last_progress_at = time.monotonic()
                     self._condition.notify_all()
                 sequence += 1
                 latest_timestamp = timestamp
                 last_progress = time.monotonic()
+                if self._frame_limit is not None and sequence >= self._frame_limit:
+                    self._request_stop("single_complete")
         except Exception as exc:
             error = exc
             with self._condition:
                 self._error = f"{type(exc).__name__}: {exc}"
                 self._state = "failed"
+                self._request_stop("capture_failed")
                 self._condition.notify_all()
         finally:
+            self._request_stop("capture_failed" if error is not None else "completed")
             if camera is not None:
                 for cleanup in (
                     lambda: self._release_pending(camera, pending),
@@ -474,9 +522,37 @@ class Picamera2FrameCapture:
                         if error is None:
                             error = exc
             with self._condition:
-                if error is not None:
+                if self._external_error is not None:
+                    self._error = self._external_error
+                    self._state = "failed"
+                elif error is not None:
                     self._error = f"{type(error).__name__}: {error}"
                     self._state = "failed"
                 else:
                     self._state = "stopped"
+                self._finished.set()
                 self._condition.notify_all()
+
+    def _watchdog(self) -> None:
+        """Enforce on-demand limits even when request extraction blocks natively.
+
+        This only requests shutdown. The camera worker still exclusively owns
+        stop/close, and the session separately reports cleanup that exceeds 3 s.
+        """
+        with self._condition:
+            while not self._stop.is_set():
+                now = time.monotonic()
+                duration_deadline = (None if self._max_duration is None else
+                                     self._started_at + self._max_duration)
+                frame_deadline = self._last_progress_at + self.config.frame_timeout
+                if duration_deadline is not None and now >= duration_deadline:
+                    self._request_stop("duration_limit")
+                    return
+                if now >= frame_deadline:
+                    self._external_error = "RuntimeError: Camera frame acquisition timed out"
+                    self._error = self._external_error
+                    self._state = "failed"
+                    self._request_stop("capture_failed")
+                    return
+                next_deadline = min(frame_deadline, duration_deadline) if duration_deadline else frame_deadline
+                self._condition.wait(max(0.0, next_deadline - now))
